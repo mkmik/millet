@@ -228,21 +228,8 @@ fn edges_truncate_the_belt_in_hardware() {
     ];
     let img = Image {
         bundles,
-        ebbs: vec![
-            EbbEntry {
-                bundle: 0,
-                arity: 0,
-            },
-            EbbEntry {
-                bundle: 2,
-                arity: 1,
-            },
-        ],
-        funcs: vec![FuncEntry {
-            ebb: 0,
-            arity: 0,
-            nres: 0,
-        }],
+        ebbs: vec![EbbEntry::new(0, 0), EbbEntry::new(2, 1)],
+        funcs: vec![FuncEntry::new(0, 0, 0)],
         data: vec![],
         entry: 0,
     };

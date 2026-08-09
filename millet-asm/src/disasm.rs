@@ -5,13 +5,13 @@ use millet_core::Image;
 
 pub fn ebb_name(img: &Image, i: usize) -> String {
     match img.funcs.iter().position(|f| f.ebb as usize == i) {
-        Some(f) => format!("fn{f}"),
-        None => format!("ebb{i}"),
+        Some(f) => func_name(img, f),
+        None => img.ebb_label(i),
     }
 }
 
-pub fn func_name(_img: &Image, i: usize) -> String {
-    format!("fn{i}")
+pub fn func_name(img: &Image, i: usize) -> String {
+    img.func_label(i)
 }
 
 pub fn disassemble(img: &Image) -> Result<String, String> {

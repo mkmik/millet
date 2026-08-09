@@ -6,17 +6,42 @@ use std::fmt;
 pub const MAGIC: &[u8; 4] = b"MILT";
 pub const VERSION: u32 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EbbEntry {
     pub bundle: u32,
     pub arity: u8,
+    /// Source label, kept in the image purely so traces and disassembly can
+    /// say `loop` instead of `ebb3`. Empty when the image was built by hand.
+    pub name: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FuncEntry {
     pub ebb: u32,
     pub arity: u8,
     pub nres: u8,
+    pub name: String,
+}
+
+impl EbbEntry {
+    pub fn new(bundle: u32, arity: u8) -> EbbEntry {
+        EbbEntry {
+            bundle,
+            arity,
+            name: String::new(),
+        }
+    }
+}
+
+impl FuncEntry {
+    pub fn new(ebb: u32, arity: u8, nres: u8) -> FuncEntry {
+        FuncEntry {
+            ebb,
+            arity,
+            nres,
+            name: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +89,11 @@ impl<'a> Reader<'a> {
     fn u64(&mut self) -> Result<u64, ImageError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+    fn string(&mut self) -> Result<String, ImageError> {
+        let n = self.u32()? as usize;
+        String::from_utf8(self.take(n)?.to_vec())
+            .map_err(|_| ImageError("label is not valid UTF-8".into()))
+    }
 }
 
 impl Image {
@@ -84,11 +114,13 @@ impl Image {
         for e in &self.ebbs {
             out.extend_from_slice(&e.bundle.to_le_bytes());
             out.extend_from_slice(&(e.arity as u32).to_le_bytes());
+            put_str(&mut out, &e.name);
         }
         for f in &self.funcs {
             out.extend_from_slice(&f.ebb.to_le_bytes());
             out.extend_from_slice(&(f.arity as u32).to_le_bytes());
             out.extend_from_slice(&(f.nres as u32).to_le_bytes());
+            put_str(&mut out, &f.name);
         }
         for d in &self.data {
             out.extend_from_slice(&d.addr.to_le_bytes());
@@ -122,6 +154,7 @@ impl Image {
             ebbs.push(EbbEntry {
                 bundle: r.u32()?,
                 arity: r.u32()? as u8,
+                name: r.string()?,
             });
         }
         let mut funcs = Vec::with_capacity(n_funcs);
@@ -130,6 +163,7 @@ impl Image {
                 ebb: r.u32()?,
                 arity: r.u32()? as u8,
                 nres: r.u32()? as u8,
+                name: r.string()?,
             });
         }
         let mut data = Vec::with_capacity(n_data);
@@ -153,10 +187,41 @@ impl Image {
         })
     }
 
+    /// Display name for an EBB, falling back to a generated one.
+    pub fn ebb_label(&self, i: usize) -> String {
+        match self.ebbs.get(i) {
+            Some(e) if !e.name.is_empty() => e.name.clone(),
+            _ => format!("ebb{i}"),
+        }
+    }
+
+    /// Display name for a function, falling back to a generated one.
+    pub fn func_label(&self, i: usize) -> String {
+        match self.funcs.get(i) {
+            Some(f) if !f.name.is_empty() => f.name.clone(),
+            _ => format!("fn{i}"),
+        }
+    }
+
     /// EBB index whose entry is `bundle`, if any.
     pub fn ebb_at(&self, bundle: u32) -> Option<usize> {
         self.ebbs.iter().position(|e| e.bundle == bundle)
     }
+
+    /// EBB index containing `bundle` — the last one starting at or before it.
+    pub fn ebb_containing(&self, bundle: u32) -> Option<usize> {
+        self.ebbs
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.bundle <= bundle)
+            .max_by_key(|(_, e)| e.bundle)
+            .map(|(i, _)| i)
+    }
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
 }
 
 #[cfg(test)]
@@ -170,11 +235,13 @@ mod tests {
             ebbs: vec![EbbEntry {
                 bundle: 0,
                 arity: 2,
+                name: "main".into(),
             }],
             funcs: vec![FuncEntry {
                 ebb: 0,
                 arity: 2,
                 nres: 1,
+                name: "main".into(),
             }],
             data: vec![DataSeg {
                 addr: 0x1000,

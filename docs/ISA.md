@@ -114,10 +114,14 @@ version u32 = 1
 counts  u32 × 4   bundles, ebbs, funcs, data segments
 entry   u32       index into the function table
 code    bundles × 4 × u32
-ebbs    each: u32 first bundle, u32 arity
-funcs   each: u32 ebb index, u32 arity, u32 result count
+ebbs    each: u32 first bundle, u32 arity, u32 name length + name bytes
+funcs   each: u32 ebb index, u32 arity, u32 result count, name
 data    each: u64 load address, u32 length, bytes
 ```
+
+Source labels are carried in the image so traces and disassembly can say
+`as_loop` rather than `ebb3`. They are debug information only — nothing in
+execution depends on them, and a hand-built image may leave them empty.
 
 Execution starts at the entry function, which must take no arguments.
 `.entry` names it; without one the assembler looks for `main`.

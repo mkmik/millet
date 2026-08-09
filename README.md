@@ -31,7 +31,17 @@ msim --trace-json  prog.mimg the same, one JSON object per line
 msim --stats       prog.mimg cycles, calls, depth, slot occupancy
 ```
 
-Traces go to stderr, program output to stdout.
+Traces go to stderr, program output to stdout. A `--trace` line names the EBB
+the bundle belongs to and lists what is still in flight and when it lands:
+
+```
+[     5] frame 1 bundle 6 in as_loop  (in flight: +1)
+       a0  add b3, b0
+       a1  con 1
+       drop <- 4104  (slot a0 issued at +0)
+       drop <- 1  (slot a1 issued at +0)
+       belt b0=1 b1=4104 b2=8 b3=0 b4=5 b5=4096
+```
 
 ## Writing a program
 

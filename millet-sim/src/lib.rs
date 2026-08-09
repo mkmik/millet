@@ -84,6 +84,21 @@ impl Frame {
         self.live = ((self.live << 1) | 1) & mask(self.belt.len());
     }
 
+    /// " (in flight: +2, +5)" — how many bundles until each pending result
+    /// lands. Empty when nothing is outstanding.
+    fn pending_summary(&self, now: usize) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let mut when: Vec<String> = self
+            .pending
+            .iter()
+            .map(|p| format!("+{}", p.retire_at as i64 - now as i64))
+            .collect();
+        when.sort();
+        format!("  (in flight: {})", when.join(", "))
+    }
+
     fn truncate(&mut self, k: usize) {
         for i in k..self.belt.len() {
             self.belt[i] = 0;
@@ -244,9 +259,14 @@ impl<'a> Machine<'a> {
         });
         self.stats.bundles += 1;
         if self.opts.trace {
+            let ebb = img
+                .ebb_containing(pc as u32)
+                .map(|i| img.ebb_label(i))
+                .unwrap_or_default();
+            let inflight = self.frames[depth].pending_summary(t);
             let _ = writeln!(
                 self.log,
-                "[{:>6}] frame {depth} bundle {pc}",
+                "[{:>6}] frame {depth} bundle {pc} in {ebb}{inflight}",
                 self.stats.bundles - 1
             );
         }
@@ -350,22 +370,23 @@ impl<'a> Machine<'a> {
                     }
                 }
                 Op::Call { target, args } => {
-                    let f = *img
+                    let f = img
                         .funcs
                         .get(*target as usize)
                         .ok_or_else(|| Stop::Fault("call target out of range".into()))?;
-                    if f.arity as usize != args.len() {
+                    let (f_ebb, f_arity, f_nres) = (f.ebb, f.arity, f.nres);
+                    if f_arity as usize != args.len() {
                         return Err(Stop::Fault(format!(
                             "call passes {} arguments to a function of arity {}",
                             args.len(),
-                            f.arity
+                            f_arity
                         )));
                     }
                     if self.frames.len() >= 200_000 {
                         return Err(Stop::Fault("call depth exhausted".into()));
                     }
-                    let entry = img.ebbs[f.ebb as usize].bundle as usize;
-                    let nres = f.nres as usize;
+                    let entry = img.ebbs[f_ebb as usize].bundle as usize;
+                    let nres = f_nres as usize;
                     let mut callee = Frame::new(&self.cfg, entry);
                     // Arguments drop in listed order: last-listed is b0.
                     for a in args {
@@ -514,7 +535,7 @@ impl<'a> Machine<'a> {
         f.time += 1;
         match branch_to {
             Some(target) => {
-                let e = *img
+                let e = img
                     .ebbs
                     .get(target)
                     .ok_or_else(|| Stop::Fault("branch target out of range".into()))?;
@@ -537,7 +558,10 @@ impl<'a> Machine<'a> {
     }
 
     fn render(&self, op: &Op) -> String {
-        format_op(op, &|i| format!("ebb{i}"), &|i| format!("fn{i}"))
+        let img = self.img;
+        format_op(op, &|i| img.ebb_label(i as usize), &|i| {
+            img.func_label(i as usize)
+        })
     }
 
     fn syscall(&mut self, code: u8, a: u64, b: u64, c: u64) -> Result<Option<u64>, Stop> {

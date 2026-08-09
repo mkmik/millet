@@ -103,6 +103,7 @@ pub fn assemble(src: &str, cfg: &Config) -> Result<Assembled, AsmError> {
                 ebbs.push(EbbEntry {
                     bundle: n_bundles,
                     arity: *arity,
+                    name: name.clone(),
                 });
                 ebb_names.push(name.clone());
                 ebb_of.insert(name.clone(), idx);
@@ -128,6 +129,7 @@ pub fn assemble(src: &str, cfg: &Config) -> Result<Assembled, AsmError> {
                         ebb: idx,
                         arity: *arity,
                         nres: *nres,
+                        name: name.clone(),
                     });
                     func_names.push(name.clone());
                     func_of.insert(name.clone(), fidx);
