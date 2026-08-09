@@ -1,2 +1,2 @@
-# millie
+# millet
 Explorations on the Mill ISA
