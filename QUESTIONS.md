@@ -4,6 +4,11 @@ Questions raised by a close read of `PRD.md`, grouped by how much they block
 implementation. Each question cites the relevant section and, where possible,
 proposes a default so answering can be a one-word "accept" or a correction.
 
+> **Status: closed.** Every question below is resolved and all decisions
+> have been folded back into `PRD.md`, which is again the single ground
+> truth. This file remains as the record of the reasoning; `MILL-NOTES.md`
+> holds the supporting Mill research.
+
 ## Decisions so far
 
 - **A1 — resolved: post-drop numbering.** Reshape operands/mask are

@@ -56,7 +56,7 @@ The belt is a fixed-size queue of 16 values. `b0` is the most recently dropped v
 
 Operands are consumed non-destructively; reading `b3` does not remove it. Values leave the belt only by falling off the far end as newer values are dropped.
 
-**Falling off is silent.** There is no fault for a value expiring. Reading a belt position that has never been written since frame entry yields a defined poison value (§8.4) — but reading a position holding an unintended stale value is simply a bug the assembler tries to catch statically.
+**Falling off is silent.** There is no fault for a value expiring. Reading a belt position that has never been written since frame entry yields **zero** (§8.4) — but reading a position holding an unintended stale value is simply a bug the assembler tries to catch statically.
 
 ### 3.1 Drop ordering
 
@@ -68,7 +68,7 @@ This rule is the whole contract. It means a load issued three bundles ago retire
 
 ### 3.2 Belt state is a static property
 
-At every instruction boundary, the belt's contents are fully determined by the instruction stream — no data-dependent variation. The assembler models the belt exactly, which is what lets it *verify* hand-written belt offsets (§9.3) even though it never *invents* them (§9.2).
+At every instruction boundary, the belt's *occupancy* — which positions are live, which op produced each, and the full retire schedule — is fully determined by the instruction stream; only the values themselves are data-dependent. The assembler models this exactly, which is what lets it *verify* hand-written belt offsets (§9.3) even though it never *invents* them (§9.2).
 
 ---
 
@@ -76,13 +76,15 @@ At every instruction boundary, the belt's contents are fully determined by the i
 
 An EBB has **one entry point and any number of exits.** All control flow targets are EBB entries; you cannot branch into the middle of an EBB.
 
-Each EBB declares an **entry arity** `k` — the number of live belt values it expects on entry, occupying `b0..b(k-1)`. Belt positions `bk..b15` are poison on entry.
+Each EBB declares an **entry arity** `k` — the number of live belt values it expects on entry, occupying `b0..b(k-1)`. Taking any edge into an EBB truncates the belt: positions `bk..b15` read as zero afterwards. This truncation is machine-enforced, not merely an assembler convention. Falling through into the next EBB's entry is a legal edge, subject to the same checks — a conditional-branch bundle therefore has two successor edges.
 
 ```
 .ebb loop_body(3)      ; expects 3 live values at b0,b1,b2
 ```
 
 The assembler verifies that **every** predecessor edge delivers exactly `k` values. This is the phi-node problem made explicit and checkable — and it's why `conform`/`rescue` exist.
+
+**No in-flight results may cross an edge.** Every operation issued in an EBB must retire before any control transfer out of it, taken or fall-through; the assembler rejects violations (§9.3 check 9). This mirrors the Mill, where the specializer forces all operations except loads to retire before any belt-carrying branch — and every Millet EBB entry is arity-declaring. The Mill's tag-and-pickup load form, which lets loads cross such edges, is a designated future extension (see `MILL-NOTES.md`).
 
 Functions are EBBs with an additional property: they start a new frame (§6).
 
@@ -122,7 +124,7 @@ Two ALU slots means genuine ILP scheduling pressure without combinatorial explos
 Consequences worth internalizing:
 
 - Two ops in the same bundle cannot communicate. `A1` cannot read `A0`'s result.
-- A `conform` or `rescue` in slot `F` reads the *entry* belt state, and its rewrite is applied **after** this bundle's own drops (§7.2).
+- Exception: a `conform` or `rescue` in slot `F` interprets its operands against the **post-drop** belt — the state after this bundle's §3.1 drops — and its rewrite is applied last (§7.2).
 - Only one branch may be present per bundle (slot `F` is singular), which sidesteps Mill's exit-priority rules entirely.
 
 ### 5.4 Latency
@@ -136,9 +138,16 @@ Every operation has a **fixed, architecturally specified latency** measured in b
 | div, rem | 8 |
 | load | **programmer-specified**, 3–15 (§8.2) |
 | store, branches, `conform`, `rescue` | n/a (no result) |
+| `sys` (codes with a result) | 1 |
 | call | see §6.2 |
 
+Latencies count bundles of the issuing frame only; a callee's execution consumes none of them (§6.2).
+
 The machine does not check readiness. The assembler does, and refuses to emit code that reads a belt position that a not-yet-retired op will occupy.
+
+### 5.5 Arithmetic semantics
+
+Compares (`eq ne lt le ltu leu`; signed unless `u`-suffixed) drop 64-bit `0` or `1`. `brt`/`brf` and `pick` treat any nonzero value as true. Shifts are `shl`, `shr` (logical right), `sar` (arithmetic right). `mul` drops the low 64 bits. `add`/`sub`/`mul` and shifts wrap silently. `div`/`rem` come in signed and unsigned forms; division by zero and signed `INT_MIN / -1` are faults. The full opcode table (mnemonics + encodings) is an M0 deliverable, reviewed before anything depends on it.
 
 ---
 
@@ -148,8 +157,8 @@ The machine does not check readiness. The assembler does, and refuses to emit co
 
 A call creates a new frame containing:
 
-- a **fresh belt** — 16 positions, all poison except the arguments
-- a **fresh scratchpad** — 64 slots, all poison
+- a **fresh belt** — 16 positions, all zero except the arguments
+- a **fresh scratchpad** — 64 slots, all zero
 - a return address (not architecturally visible; no way to read or write it)
 
 The caller's belt and scratchpad are entirely inaccessible to the callee. This is the single most important structural property of the Mill call model and the reason the belt is workable at all.
@@ -164,7 +173,9 @@ Arguments are dropped onto the callee's fresh belt **in listed order**, so the l
 
 From the caller's perspective a call is a single operation with **unbounded latency**: results retire at the end of the calling bundle, and no op issued in the same bundle observes them (§5.3). The simulator executes the callee to completion synchronously.
 
-Argument count is capped at 3 by encoding (§10). Beyond that, pass a pointer to a memory block.
+Callee execution is invisible to caller timing: an in-flight caller operation (e.g. a deferred load issued before the call) does not count callee bundles against its latency — delays are frame-local. This is exactly the Mill's rule, where calls take zero cycles in the caller's schedule and in-flights retire "as if the call hadn't happened" (`MILL-NOTES.md` §2).
+
+Argument count is capped at 3 by encoding (§10); declaring a `.func` arity above 3 is an assembler error. Beyond that, pass a pointer to a memory block.
 
 ### 6.3 `retn`
 
@@ -173,6 +184,8 @@ retn b_x, b_y, ...                  ; 0..3 results
 ```
 
 Destroys the current frame; results are dropped onto the *caller's* belt in listed order, subject to §3.1 ordering relative to anything else retiring in the caller's call bundle.
+
+Returning while the frame's own operations are still in flight is legal; their results are silently discarded — the Mill's "dead on creation" rule. The assembler warns.
 
 The number of results a function returns is declared and checked:
 
@@ -193,22 +206,22 @@ These exist because EBBs have declared entry arities and predecessors rarely hav
 ```
 rescue  mask16
 ```
-Retains the belt positions selected by a 16-bit mask, **preserving their relative order**, compacted into `b0..b(k-1)`. Everything else becomes poison. Cheap to encode, and it's the natural loop-back operation where live values are already in the right relative order.
+Retains the belt positions selected by a 16-bit mask (bit *i* selects `b_i`), **preserving their relative age**, compacted into `b0..b(k-1)` — the youngest selected value lands at `b0`. Everything else becomes zero. Cheap to encode, and it's the natural loop-back operation where live values are already in the right relative order.
 
 ```
 conform b_a, b_b, b_c, b_d, b_e, b_f
 ```
-Explicitly reorders: the listed positions become `b0..b5` in the order given, everything else poison. **Capped at 6 positions** by the encoding — a real constraint. If you need to reorder more than six live values across an edge, use the scratchpad.
+Explicitly reorders: the listed positions become `b0..b5` in the order given — first-listed → `b0`, which is deliberately the *opposite* convention from `call`/`retn`, where the last-listed argument becomes `b0`. Everything else becomes zero. **Capped at 6 positions** by the encoding — a real constraint; arity is carried by six distinct opcodes `conform1..conform6` (§10). If you need to reorder more than six live values across an edge, use the scratchpad.
 
 `conform` is the general operation; `rescue` is the compact special case. Both live in slot `F`, which means **a bundle containing a reshape cannot also contain a branch.** Reshapes therefore occupy the bundle immediately preceding a branch, or the branch's own fall-through path.
 
-> *Open question, §12:* whether to fuse reshape into the branch encoding instead. It costs a wider `F` slot but removes a bundle from every loop back-edge. Deferring, because the unfused version is easier to reason about first.
+> *Direction settled, §12:* the Mill itself later fused `conform` into its branch ops — but on a variable-width encoding. A fused form needs 48–56 bits against Millet's 32-bit slot, so v0 stays unfused; the future shape is a two-slot "long F" op (see §12 item 2 and `MILL-NOTES.md` §1b).
 
 ### 7.2 Ordering
 
-A reshape reads the belt as of bundle entry (§5.3), but is applied **after** the bundle's own drops. So a value computed in the same bundle *can* be rescued — it just has to be named by the belt position it will occupy, which the assembler knows.
+A reshape's operands — `conform`'s list, `rescue`'s mask — are interpreted against the **post-drop** belt: the state after this bundle's own §3.1 drops. The rewrite is applied last. A value computed in the same bundle can therefore be rescued; it is named by the position it occupies after the drops, which the assembler knows exactly.
 
-This is subtle and is the highest-risk semantic decision in the document. It needs a dedicated test.
+This is subtle and is the highest-risk semantic rule in the document. It needs a dedicated test.
 
 ---
 
@@ -229,7 +242,8 @@ store b_addr, offset, width, b_value       → no result
 
 - `width` ∈ {1, 2, 4, 8} bytes
 - `ext` ∈ {zero, sign} for widths < 8
-- `delay` ∈ 3..15 — **the programmer chooses the latency**, and the result retires exactly that many bundles later, per §3.1
+- `delay` ∈ 3..15 — **the programmer chooses the latency**, and the result retires exactly that many bundles later, per §3.1. Encoded delay values 0–2 are illegal; assembler and disassembler both reject them.
+- `offset` is a signed 13-bit byte offset, for both `load` and `store` (the store encoding's spare bit is reserved-zero)
 
 Deferred loads are the most distinctively Mill idea surviving the cut. The programmer hoists the load far above its use and states how far. The simulator honours the declared delay exactly (no early completion, no stall) — which makes mis-scheduled code fail deterministically rather than accidentally working.
 
@@ -246,9 +260,11 @@ fill  sN             ; → 1 result, latency 3
 
 `N` is a literal 0..63; there is no computed scratchpad addressing. This is where long-lived locals go when 16 belt positions aren't enough — which, with two ALU slots retiring per cycle, is constantly.
 
-### 8.4 Poison
+Spill-to-fill ordering mirrors §8.2 exactly: a spill takes effect at its issuing bundle's end; a fill samples the scratchpad at issue and observes spills from strictly earlier bundles only. Note that `load`/`store`/`spill`/`fill` all compete for the single M slot — real scheduling pressure.
 
-Uninitialized belt positions and scratchpad slots hold a distinguished poison value. Reading it is **not** a fault (that would require metadata). Instead the simulator tracks poison out-of-band and reports a warning at first use plus a hard error at `sys`/`store` of a poison-derived value. Cheap, catches real bugs, and doesn't smuggle metadata into the architecture.
+### 8.4 Uninitialized values
+
+There is no poison in v0 — proper poison requires operand metadata (NaR), which is explicitly out of scope. Uninitialized belt positions and scratchpad slots simply read as **zero**, deterministically. Reading one is a bug the assembler tries to catch statically via the liveness and arity checks (§9.3); the machine itself neither tracks nor faults. NaR-style poison arrives with the metadata extension (§11).
 
 ### 8.5 Constants
 
@@ -256,7 +272,7 @@ Uninitialized belt positions and scratchpad slots hold a distinguished poison va
 con imm24            ; sign-extended to 64 bits → 1 result
 ```
 
-24-bit signed immediate. Wider constants come from the assembler pseudo-op `movi imm64`, which expands to a constant-pool `load` or a `con`/`shl`/`or` sequence — assembler's choice, documented in output.
+24-bit signed immediate. There is no wider-constant pseudo-op in v0: a multi-op expansion would occupy slots and drop belt values the programmer didn't write, crossing the no-inference line of §9.2. Wider constants are built by hand from `con`/`shl`/`or`, or loaded from a constant the programmer lays out in a `.data` section (§10).
 
 ---
 
@@ -271,17 +287,19 @@ con imm24            ; sign-extended to 64 bits → 1 result
 | Disassembler | Rust | round-trip verified against assembler |
 | Test suite | — | golden traces + differential |
 
-One repo, one crate workspace. The simulator's machine parameters (§2) live in a single config struct so the FPGA-oriented belt-8 / 4-slot variant is a parameter change, not a fork.
+One repo, one crate workspace: `millet-core` (ISA definitions, encoding, machine config), `millet-asm` (binary `mas`; the disassembler is `mas -d`), `millet-sim` (binary `msim`). Source files use the `.mil` extension. The simulator's machine parameters (§2) live in a single config struct so the FPGA-oriented belt-8 / 4-slot variant is a parameter change, not a fork.
 
 ### 9.2 Raw belt offsets — no symbolic naming in v0
 
 **The assembler accepts literal belt positions only.** Every operand is written as `b0..b15`, exactly as encoded. The programmer tracks belt state manually, including the renumbering caused by every drop.
 
+**Concrete syntax:** one op per line, prefixed by its slot tag (`a0`, `a1`, `m`, `f`); a blank line ends the bundle. Unused slots are omitted and assemble to `NOP`. Comments start with `;`; the reference style is a trailing belt-state comment per bundle.
+
 ```
 .ebb loop(3)                        ; b0=i  b1=n  b2=p
-    load    b2, 0, 8, zero, 4       ; retires at +4
-    add     b0, b3                  ; b3 = the constant 1, dropped earlier
-    ...                             ; after this bundle: b0=sum', b1=i, b2=n, b3=p, ...
+    m   load    b2, 0, 8, zero, 4   ; retires at +4
+    a0  add     b0, b3              ; b3 = the constant 1, dropped earlier
+                                    ; after this bundle: b0=sum', b1=i, b2=n, b3=p, ...
 ```
 
 This is deliberate and it is the point of the exercise. The renumbering *is* the belt; automating it away before understanding it would defeat the purpose of building this at all. Manual tracking will be painful, and the shape of that pain is a primary output of the project (§13, M6) — it's the empirical input to designing the layer that eventually removes it.
@@ -306,8 +324,9 @@ Permitted conveniences (these do not cross the line): symbolic labels for EBBs a
 6. Call/return arity against declarations
 7. Scratchpad slot in range
 8. Warn on provable store/deferred-load overlap
+9. No operation still in flight at any control transfer out of an EBB (§4); warn on in-flight ops at `retn` (§6.3)
 
-Checks 1 and 4 together are the assembler's whole reason to exist.
+Each check carries a stable error code (`E1`–`E9`) and a dedicated test. Checks 1 and 4 together are the assembler's whole reason to exist.
 
 ### 9.4 Simulator output
 
@@ -325,6 +344,8 @@ A single `sys` op, minimal by design:
 | 1 | `write(fd=b0, ptr=b1, len=b2)` → bytes written |
 | 2 | `read(fd=b0, ptr=b1, len=b2)` → bytes read |
 
+`sys` is the one op that takes its operands from fixed belt positions (`b0..b2`) rather than naming them. It is legal only in slot F; codes 1 and 2 drop their result with latency 1.
+
 Enough to write tests that print. Nothing more.
 
 ---
@@ -334,21 +355,23 @@ Enough to write tests that print. Nothing more.
 32-bit slot, 8-bit opcode, 4-bit belt references.
 
 ```
-ALU 3-operand:   [op:8][b_a:4][b_b:4][unused:16]
+ALU 2-operand:   [op:8][b_a:4][b_b:4][unused:16]
 pick:            [op:8][b_c:4][b_t:4][b_f:4][unused:12]
 con:             [op:8][imm:24]
-load:            [op:8][b_addr:4][delay:4][w:2][ext:1][offset:13]
-store:           [op:8][b_addr:4][b_val:4][w:2][offset:14]
+load:            [op:8][b_addr:4][delay:4][w:2][ext:1][offset:13]   ; offset signed
+store:           [op:8][b_addr:4][b_val:4][w:2][offset:13][z:1]     ; offset signed, z reserved-zero
 spill/fill:      [op:8][slot:6][b_val:4][unused:14]
-branch:          [op:8][b_cond:4][target:20]      ; EBB index or PC-relative
+branch:          [op:8][b_cond:4][target:20]      ; EBB-table index
 call:            [op:8][nargs:2][b_a:4][b_b:4][b_c:4][target:10]
 retn:            [op:8][nres:2][b_x:4][b_y:4][b_z:4][unused:10]
-conform:         [op:8][b0:4][b1:4][b2:4][b3:4][b4:4][b5:4]
+conform1..6:     [op:8][b0:4][b1:4][b2:4][b3:4][b4:4][b5:4]         ; arity in opcode; unused refs zero
 rescue:          [op:8][mask:16][unused:8]
 sys:             [op:8][code:8][unused:16]
 ```
 
 `call` target at 10 bits implies a function table rather than a direct offset — a reasonable v0 simplification (indirect calls come free later via a table index on the belt). Fields marked unused must be zero; the disassembler checks.
+
+**Binary image format:** minimal and custom — a small header (magic, version) plus sections: code, EBB table, function table, and `.data` blobs each with a load address. Execution starts at `.func main(0) -> 0`; `sys 0` sets the process exit code, and `retn` from `main` exits 0. Initial memory contents come solely from `.data` sections.
 
 ---
 
@@ -367,13 +390,14 @@ Separately, and on the tooling rather than the architecture side: the symbolic a
 ## 12. Decisions I expect to revisit
 
 1. **Belt 16 vs 8.** 16 for writability; 8 is the FPGA target. Parameterize from day one.
-2. **Fused reshape+branch.** Would remove a bundle from every back-edge at the cost of a wider `F` slot. §7.1.
-3. **Reshape ordering relative to same-bundle drops.** §7.2 is the subtlest rule here and may want inverting.
+2. **Fused reshape+branch.** Would remove a bundle from every back-edge. The Mill itself ended up fusing (`MILL-NOTES.md` §1b), but on variable-width encoding; a fused form needs 48–56 bits against our 32-bit slot. The designated future shape is a two-slot "long F" op — the F opcode claims the M slot's word as an extension — which also lifts the `conform` cap (item 4). §7.1.
+3. **Reshape ordering relative to same-bundle drops.** Decided: post-drop numbering (§7.2). Still the subtlest rule here; revisit after real code exists.
 4. **`conform` capped at 6.** Falls out of a 32-bit slot; a 2-slot `conform` would lift it.
 5. **Slot mix.** 2×ALU + M + F is a guess. Real code may want 2 memory slots, or a dedicated `con` slot.
 6. **Fixed 16-byte bundles.** Wasteful; a slot-mask header is the obvious density fix if bundle fetch ever matters.
 7. **Call as unbounded latency.** Fine for a simulator, meaningless for RTL. Revisit before any hardware work.
-8. **Poison as out-of-band tracking.** A pragmatic stand-in for NaR; it disappears when metadata arrives.
+8. **Uninitialized-reads-as-zero.** A pragmatic stand-in for NaR; it disappears when metadata arrives.
+9. **In-flight ops barred from crossing edges.** The strictest reading of the Mill's join rule (§4). The Mill's tag-and-pickup load form would relax it for loads; add it if deferred loads across back-edges turn out to matter in practice.
 
 ---
 
