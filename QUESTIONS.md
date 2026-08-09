@@ -37,6 +37,18 @@ proposes a default so answering can be a one-word "accept" or a correction.
   same, plus an assembler warning as a courtesy the Mill doesn't offer.
   (Note A2's check subsumes most cases: ops can only be in flight at
   `retn` if issued in the `retn`'s own EBB.)
+- **§12.2 (fused reshape+branch) — stays unfused in v0, direction noted.**
+  The research (`MILL-NOTES.md` §1b) shows the modern Mill deleted the
+  standalone `conform`: "the functionality was moved to branch ops so a
+  taken branch can rearrange the belt to match the destination." But that
+  fusion rides on the Mill's variable-width encoding: fused in Millet would
+  need 48 bits (branch+rescue) to 56 bits (branch+conform) against a 32-bit
+  slot that the branch already fills exactly. v0 keeps the unfused
+  reshape-bundle-then-branch form. The designated future shape is a
+  **two-slot "long F" op** — the F opcode claims the M slot's 32 bits as an
+  extension word — which fuses reshape into branches *and* lifts the
+  `conform` 6-position cap (§12.4) with one mechanism, at the cost of the
+  memory op in those bundles, while keeping fixed-width decode trivial.
 - **A7 / §8.4 — resolved: no poison in v0.** Proper poison needs operand
   metadata (NaR), which is explicitly out of scope. Uninitialized belt
   positions and scratchpad slots simply read as **zero** in the simulator.
