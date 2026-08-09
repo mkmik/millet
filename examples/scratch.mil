@@ -1,0 +1,34 @@
+; scratch.mil — M2: spill/fill and a multi-cycle ALU op.
+;
+; `spill` takes effect at the end of its issuing bundle; `fill` samples the
+; scratchpad at issue and sees only spills from strictly earlier bundles —
+; the exact mirror of the store/load rule (PRD §8.3).
+;
+; Computes (6+7) * 7 = 91 and exits with it.
+
+.func main(0) -> 0
+    a0  con 6
+    a1  con 7
+                                ; belt: b0=7 b1=6
+
+    m   spill s3, b0                ; stash 7; visible to fills from the next bundle
+    a0  add   b0, b1                ; 13
+                                ; belt: b0=13 b1=7 b2=6
+
+    m   fill  s3                    ; latency 3: retires at the end of +2
+                                ; belt: b0=13 b1=7 b2=6
+
+    a0  nop
+
+    a0  nop
+                                ; belt: b0=7 b1=13 b2=7 b3=6
+
+    a0  mul b0, b1                  ; latency 3: retires at the end of +2
+                                ; belt: unchanged
+
+    a0  nop
+
+    a0  nop
+                                ; belt: b0=91 ...
+
+    f   sys 0                       ; exit(91)
