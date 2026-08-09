@@ -55,6 +55,70 @@ proposes a default so answering can be a one-word "accept" or a correction.
   §8.4's out-of-band taint tracking is dropped; all of A7's propagation
   questions are moot until the metadata extension.
 
+### Adopted proposals (per review: proposals with no counter-argument are simply taken)
+
+- **A4:** entry zeroing is **machine-enforced** — taking any edge into an
+  EBB truncates the belt to the declared `k` values, `bk..b15` read as
+  zero. Fall-through into an `.ebb` entry is a legal predecessor edge,
+  subject to the same arity check; a `brt`/`brf` bundle therefore has two
+  successor edges, both checked.
+- **A5:** `rescue`: bit *i* of the mask selects `b_i`; selected values keep
+  their relative age, youngest selected → `b0`. `conform`: as §7.1 says,
+  first-listed → `b0` — deliberately documented as the opposite convention
+  from `call`/`retn` argument dropping (last-listed → `b0`). Conform arity
+  is encoded by **distinct opcodes** `conform1..conform6` (opcode space is
+  cheap; no count field or sentinel needed).
+- **A6:** `fill` samples the scratchpad at issue and observes spills from
+  strictly earlier bundles only — the exact mirror of the store→load rule.
+  Corollary worth stating in the PRD: `load`/`store`/`spill`/`fill` all
+  compete for the single M slot.
+- **A8:** compares drop 64-bit 0/1; op set `eq ne lt le ltu leu` (signed
+  default, `u` suffix unsigned). `brt`/`brf`/`pick` truth test: any nonzero
+  value is true. Shifts: `shl`, `shr` (logical), `sar` (arithmetic).
+  `mul` drops the low 64 bits. `add`/`sub`/`mul`/shifts wrap silently;
+  `div`/`rem` come in signed and unsigned forms, and division by zero or
+  signed `INT_MIN / -1` is a **fault** (simulator halts with diagnostic).
+- **B2:** the implementation drafts the full opcode table (mnemonics +
+  encodings) as an M0 deliverable for review before anything depends on it.
+- **B3:** branch `target` is an **EBB index** into a per-image table;
+  `call` target is a function-table index. Binary image is a minimal
+  custom format: small header (magic, version) + sections (code, EBB
+  table, function table, data-with-load-address). Entry point is
+  `.func main(0) -> 0`; `sys 0` sets the process exit code; `retn` from
+  `main` exits 0. Initial memory comes from `.data` sections.
+- **B4:** `movi` is dropped from v0; programmers write `con`/`shl`/`or`
+  sequences by hand. Revisit with the symbolic layer.
+- **B5:** `halt` = abnormal stop (nonzero simulator exit, diagnostic);
+  `sys 0` = clean exit with code from `b0`. Both kept.
+- **B6:** `sys` reads fixed positions `b0..b2` (the one op that doesn't
+  name operands — accepted); result latency 1; legal in slot F only.
+- **B7:** load `delay` values 0–2 are illegal (assembler and disassembler
+  both reject). Load and store offsets are both **signed 13-bit**; the
+  store encoding's spare bit is reserved-zero. The "ALU 3-operand" format
+  is renamed 2-operand. No immediate ALU forms besides `con` in v0.
+  `.func` arity > 3 is an assembler error; EBB arity may be 0–16.
+- **B8:** §3.2's static-belt claim is reworded to cover occupancy/liveness
+  and schedule, not values.
+- **B1 — resolved: slot-tagged lines.** One op per line prefixed by its
+  slot tag (`a0`/`a1`/`m`/`f`); a blank line ends the bundle. Unused slots
+  are omitted (assembled as NOP). Comment leader `;`; the reference style
+  keeps a trailing belt-state comment per bundle:
+
+  ```
+      a0  add   b0, b3
+      m   load  b2, 0, 8, zero, 4
+      f   brt   b1, loop
+                            ; belt: b0=sum' b1=i b2=n
+  ```
+- **C1–C5:** all toolchain defaults adopted as written — workspace with
+  `millet-core`/`millet-asm` (`mas`)/`millet-sim` (`msim`), disassembler as
+  `mas -d`, `.mil` extension, runtime (non-const-generic) machine config,
+  golden `--trace-json` traces with a bless flag, "differential" =
+  assembler's predicted per-bundle belt state diffed against the
+  simulator's actual trace, stable error codes E1–E9 (one per static
+  check, including the new in-flight check #9), stable Rust + minimal
+  deps + GitHub Actions CI.
+
 ---
 
 ## A. Blocking semantic questions
