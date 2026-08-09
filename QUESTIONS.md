@@ -9,10 +9,34 @@ proposes a default so answering can be a one-word "accept" or a correction.
 - **A1 — resolved: post-drop numbering.** Reshape operands/mask are
   interpreted against the belt as it exists after the bundle's §3.1 drops;
   §5.3's "reads at bundle entry" is to be amended for `conform`/`rescue`.
-- **A2 — resolved in principle: do what the Mill does.** See the research
-  notes appended at the end of this document for what that concretely is.
-- **A3 — resolved: frame-local latency; discard-with-warning at `retn`**,
-  cross-checked against Mill behavior in the research notes below.
+- **A2 — resolved: do what the Mill does** (research in `MILL-NOTES.md`).
+  On the Mill, in-flight ops are frame+cycle-tagged and branches cancel
+  nothing; ops may retire across an *argless* branch. But at any join that
+  needs belt reconciliation (an arg-carrying branch — the analogue of every
+  Millet EBB entry, since Millet entries declare an arity), the specializer
+  "forces all operations (except loads) to have retired before any branch
+  with carried args"; loads cross such edges only via the tag+pickup form,
+  which Millet v0 doesn't have. Translated to Millet v0, where **every**
+  EBB entry is arity-declaring: **all in-flight ops must have retired
+  before any control transfer (taken branch or fall-through into an EBB
+  entry).** This becomes assembler check #9; the simulator may assert it
+  too. Consequences: §4's "`bk..b15` poison on entry" needs no in-flight
+  carve-out, §3.2's static-belt claim holds trivially at joins, and the
+  §14 `memcpy` criterion is still satisfiable — the load and its use just
+  live in the same iteration, with the loop body ≥ delay+1 bundles.
+  Pickup-form loads (Mill's tagged load/`pickup`/`refuse`) are noted as a
+  future extension alongside NaR and phasing.
+- **A3 — resolved: frame-local latency; discard at `retn`** — both are
+  exactly what the Mill does (`MILL-NOTES.md` §2). Mill calls are
+  zero-latency in the caller's schedule; in-flights are saved and "replayed
+  when control returns to the caller, timed and belted as if the call
+  hadn't happened," so callee time never counts against caller delays —
+  Millet's load delays count bundles of the issuing frame only. A `retn`
+  with the callee's own ops still in flight is legal on the Mill and the
+  results are silently discarded ("dead on creation"); Millet does the
+  same, plus an assembler warning as a courtesy the Mill doesn't offer.
+  (Note A2's check subsumes most cases: ops can only be in flight at
+  `retn` if issued in the `retn`'s own EBB.)
 - **A7 / §8.4 — resolved: no poison in v0.** Proper poison needs operand
   metadata (NaR), which is explicitly out of scope. Uninitialized belt
   positions and scratchpad slots simply read as **zero** in the simulator.
