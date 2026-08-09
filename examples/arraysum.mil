@@ -1,0 +1,54 @@
+; arraysum.mil — M3: the classic loop, reshaping the back edge with `rescue`.
+;
+; `rescue` keeps the selected positions in age order (youngest at b0), which
+; is exactly what a loop wants when the carried values happen to be produced
+; in the right order — so the loop's carried set is (acc, n, p), not the
+; (acc, p, n) the caller naturally has. `conform` fixes that up once, at
+; entry; the hot path pays only the cheap op.
+;
+; Exits with 10+20+30+40+50 = 150.
+
+.data 0x1000
+.u64 10, 20, 30, 40, 50
+
+.func main(0) -> 0
+    a0  con 5
+    a1  con 0x1000
+                                ; belt: b0=p b1=n
+
+    f   call sum, b1, b0            ; callee sees b0=p b1=n
+                                ; belt: b0=sum ...
+
+    f   sys 0                       ; exit(150)
+
+; ---------------------------------------------------------------------------
+
+.func sum(2) -> 1               ; b0=p b1=n
+    a0  con 0                       ; acc
+                                ; belt: b0=acc b1=p b2=n
+
+    f   conform b0, b2, b1          ; belt: b0=acc b1=n b2=p
+
+.ebb as_loop(3)                 ; b0=acc b1=n b2=p
+    m   load b2, 0, 8, zero, 3      ; retires at the end of +2
+    a0  con 8
+                                ; belt: b0=8 b1=acc b2=n b3=p
+
+    a0  add b3, b0                  ; p+8
+    a1  con 1
+                                ; belt: b0=1 b1=p+8 b2=8 b3=acc b4=n b5=p
+
+    a0  sub b4, b0                  ; n-1
+                                ; the load (issued earlier) drops first
+                                ; belt: b0=n-1 b1=v b2=1 b3=p+8 b4=8 b5=acc ...
+
+    a0  add b1, b5                  ; acc+v
+                                ; belt: b0=acc' b1=n-1 b2=v b3=1 b4=p+8 ...
+
+    f   rescue 0b10011              ; keep b0, b1, b4 in age order
+                                ; belt: b0=acc' b1=n-1 b2=p+8
+
+    f   brt b1, as_loop
+
+.ebb as_done(3)                 ; b0=acc b1=0 b2=p
+    f   retn b0

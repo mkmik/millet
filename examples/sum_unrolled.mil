@@ -1,0 +1,43 @@
+; sum_unrolled.mil — M2: sum a 4-element array with no branches at all.
+;
+; All four loads are hoisted above every use. With delay 4 the first one
+; retires at the end of bundle 4, which is exactly late enough that the base
+; pointer is still sitting at b0 while the last load is issued — the whole
+; point of choosing the delay by hand.
+;
+; Exits with the sum (10) as the process exit code.
+
+.data 0x1000
+.u64 1, 2, 3, 4
+
+.def BASE 0x1000
+
+.func main(0) -> 0
+    a0  con BASE
+                                ; belt: b0=base
+
+    m   load  b0, 0,  8, zero, 4    ; retires end of bundle 4
+                                ; belt: b0=base
+
+    m   load  b0, 8,  8, zero, 4    ; retires end of bundle 5
+                                ; belt: b0=base
+
+    m   load  b0, 16, 8, zero, 4    ; retires end of bundle 6
+                                ; belt: b0=base
+
+    m   load  b0, 24, 8, zero, 4    ; retires end of bundle 7
+                                ; belt: b0=a[0] b1=base
+
+    a0  nop
+                                ; belt: b0=a[1] b1=a[0] b2=base
+
+    a0  add   b0, b1                ; a[1]+a[0]; the bundle-3 load lands first
+                                ; belt: b0=s01 b1=a[2] b2=a[1] b3=a[0] b4=base
+
+    a0  add   b0, b1                ; s01+a[2]; the bundle-4 load lands first
+                                ; belt: b0=s012 b1=a[3] b2=s01 ...
+
+    a0  add   b0, b1                ; s012+a[3] = 10
+                                ; belt: b0=sum ...
+
+    f   sys 0                       ; exit(sum)

@@ -1,0 +1,62 @@
+; memcpy.mil — M3 / §14: a copy loop whose load is deferred 4 bundles and
+; which never touches the scratchpad. The six-bundle body is exactly long
+; enough for the load to retire before the back edge.
+
+.data 0x1000
+.ascii "millet: copied across a back edge\n"
+
+.data 0x2000
+.zero 64
+
+.def SRC 0x1000
+.def DST 0x2000
+.def LEN 34
+
+.func main(0) -> 0
+    a0  con LEN
+    a1  con SRC
+                                ; belt: b0=src b1=len
+
+    a0  con DST
+                                ; belt: b0=dst b1=src b2=len
+
+    f   call memcpy, b2, b1, b0     ; args drop in listed order: dst ends at b0
+                                ; belt: unchanged (memcpy returns nothing)
+
+    a0  con LEN                     ; len
+    a1  con DST                     ; ptr
+                                ; belt: b0=ptr b1=len b2=dst b3=src b4=len
+
+    a0  con 1                       ; fd
+                                ; belt: b0=fd b1=ptr b2=len
+
+    f   sys 1
+
+    f   retn
+
+; ---------------------------------------------------------------------------
+; The loop is the function's own entry EBB, so the back edge is just a
+; branch to `memcpy`.
+
+.func memcpy(3) -> 0            ; b0=dst b1=src b2=n
+    m   load  b1, 0, 1, zero, 4     ; retires end of +3
+    a0  con   1
+                                ; belt: b0=1 b1=dst b2=src b3=n
+
+    a0  add   b1, b0                ; dst+1
+    a1  add   b2, b0                ; src+1
+                                ; belt: b0=src+1 b1=dst+1 b2=1 b3=dst b4=src b5=n
+
+    a0  sub   b5, b2                ; n-1
+                                ; belt: b0=n-1 b1=src+1 b2=dst+1 b3=1 b4=dst b5=src b6=n
+
+    a0  nop                         ; the load lands here
+                                ; belt: b0=byte b1=n-1 b2=src+1 b3=dst+1 b4=1 b5=dst ...
+
+    m   store b5, 0, 1, b0          ; *dst = byte
+    f   conform b3, b2, b1          ; belt: b0=dst+1 b1=src+1 b2=n-1
+
+    f   brt b2, memcpy
+
+.ebb mc_done(3)
+    f   retn

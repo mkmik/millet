@@ -1,0 +1,17 @@
+; pick.mil — `pick` is a conditional move: with no operand metadata there is
+; no speculation to hang off it (PRD §11), so this is all it does for now.
+;
+; max(37, 91) — exits with 91.
+
+.func main(0) -> 0
+    a0  con 37
+    a1  con 91
+                                ; belt: b0=91 b1=37
+
+    a0  ltu b1, b0                  ; 37 < 91  (unsigned)
+                                ; belt: b0=cond b1=91 b2=37
+
+    a0  pick b0, b1, b2             ; cond ? 91 : 37
+                                ; belt: b0=max ...
+
+    f   sys 0

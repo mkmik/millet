@@ -1,0 +1,19 @@
+[package]
+name = "millet-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "millet_sim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "msim"
+path = "src/main.rs"
+
+[dependencies]
+millet-core = { path = "../millet-core" }
+
+[dev-dependencies]
+millet-asm = { path = "../millet-asm" }

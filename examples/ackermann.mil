@@ -1,0 +1,76 @@
+; ackermann.mil — M4: three-way recursion, exercising several EBBs per call.
+;
+;   ack(0, n) = n+1
+;   ack(m, 0) = ack(m-1, 1)
+;   ack(m, n) = ack(m-1, ack(m, n-1))
+;
+; Exits with ack(2, 3) = 9.
+
+.func main(0) -> 0
+    a0  con 2
+    a1  con 3
+                                ; belt: b0=3 b1=2
+
+    f   call ack, b0, b1            ; args drop in listed order: m ends at b0
+                                ; belt: b0=ack(2,3) ...
+
+    f   sys 0
+
+; ---------------------------------------------------------------------------
+
+.func ack(2) -> 1               ; b0=m b1=n
+    a0  con 0
+                                ; belt: b0=0 b1=m b2=n
+
+    a0  eq b1, b0                   ; m == 0
+                                ; belt: b0=cond b1=0 b2=m b3=n
+
+    f   conform b0, b2, b3          ; belt: b0=cond b1=m b2=n
+
+    f   brt b0, ack_m0
+
+.ebb ack_m1(3)                  ; m != 0;  b0=cond b1=m b2=n
+    a0  con 0
+                                ; belt: b0=0 b1=cond b2=m b3=n
+
+    a0  eq b3, b0                   ; n == 0
+                                ; belt: b0=cond2 b1=0 b2=cond b3=m b4=n
+
+    f   conform b0, b3, b4          ; belt: b0=cond2 b1=m b2=n
+
+    f   brt b0, ack_n0
+
+.ebb ack_gen(3)                 ; m>0, n>0;  b1=m b2=n
+    a0  con 1
+                                ; belt: b0=1 b1=cond2 b2=m b3=n
+
+    a0  sub b3, b0                  ; n-1
+    a1  sub b2, b0                  ; m-1
+                                ; belt: b0=m-1 b1=n-1 b2=1 b3=cond2 b4=m b5=n
+
+    f   call ack, b1, b4            ; ack(m, n-1)
+                                ; belt: b0=inner b1=m-1 b2=n-1 ...
+
+    f   call ack, b0, b1            ; ack(m-1, inner)
+                                ; belt: b0=result ...
+
+    f   retn b0
+
+.ebb ack_n0(3)                  ; n == 0;  b1=m
+    a0  con 1
+                                ; belt: b0=1 b1=cond2 b2=m b3=n
+
+    a0  sub b2, b0                  ; m-1
+                                ; belt: b0=m-1 b1=1 b2=cond2 b3=m b4=n
+
+    f   call ack, b1, b0            ; ack(m-1, 1)
+
+    f   retn b0
+
+.ebb ack_m0(3)                  ; m == 0;  b2=n
+    a0  con 1
+                                ; belt: b0=1 b1=cond b2=m b3=n
+
+    a0  add b3, b0                  ; n+1
+
+    f   retn b0
