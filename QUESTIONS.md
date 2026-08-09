@@ -4,6 +4,21 @@ Questions raised by a close read of `PRD.md`, grouped by how much they block
 implementation. Each question cites the relevant section and, where possible,
 proposes a default so answering can be a one-word "accept" or a correction.
 
+## Decisions so far
+
+- **A1 — resolved: post-drop numbering.** Reshape operands/mask are
+  interpreted against the belt as it exists after the bundle's §3.1 drops;
+  §5.3's "reads at bundle entry" is to be amended for `conform`/`rescue`.
+- **A2 — resolved in principle: do what the Mill does.** See the research
+  notes appended at the end of this document for what that concretely is.
+- **A3 — resolved: frame-local latency; discard-with-warning at `retn`**,
+  cross-checked against Mill behavior in the research notes below.
+- **A7 / §8.4 — resolved: no poison in v0.** Proper poison needs operand
+  metadata (NaR), which is explicitly out of scope. Uninitialized belt
+  positions and scratchpad slots simply read as **zero** in the simulator.
+  §8.4's out-of-band taint tracking is dropped; all of A7's propagation
+  questions are moot until the metadata extension.
+
 ---
 
 ## A. Blocking semantic questions
