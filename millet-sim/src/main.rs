@@ -3,14 +3,14 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use millet_core::{Config, Image};
+use millet_core::Config;
 use millet_sim::{Machine, Options, Stop};
 
 const USAGE: &str = "\
 msim — Millet simulator
 
 usage:
-  msim [options] <image.mimg>
+  msim [options] <image.mimg | source.mil>
 
 options:
   --trace              per-bundle belt state, drops and memory effects (stderr)
@@ -63,17 +63,10 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("msim: {path}: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let img = match Image::from_bytes(&bytes) {
+    let img = match millet_asm::load(&path) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("msim: {path}: {e}");
+            eprintln!("{e}");
             return ExitCode::from(2);
         }
     };

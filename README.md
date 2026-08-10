@@ -20,6 +20,9 @@ cargo run -p millet-sim --bin msim -- /tmp/fib.mimg
 cargo run -p millet-view --bin mview -- /tmp/fib.mimg
 ```
 
+`msim` and `mview` take a `.mil` source directly and assemble it on the fly, so
+`cargo run -p millet-view --bin mview -- examples/fib.mil` skips the `mas` step.
+
 Useful flags:
 
 ```

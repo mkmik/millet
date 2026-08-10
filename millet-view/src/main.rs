@@ -30,8 +30,9 @@ const USAGE: &str = "\
 mview — Millet trace viewer
 
 usage:
-  mview [options] <image.mimg> [trace.jsonl]
+  mview [options] <image.mimg | source.mil> [trace.jsonl]
 
+A source file is assembled on the fly.
 With no trace file mview runs the image itself. `-` reads the trace from stdin
 (`msim --trace-json prog.mimg 2>trace.jsonl` writes one there).
 
@@ -1194,13 +1195,10 @@ fn main() -> ExitCode {
     };
     COLOR.set(std::env::var_os("NO_COLOR").is_none()).ok();
 
-    let img = match std::fs::read(&path)
-        .map_err(|e| e.to_string())
-        .and_then(|b| Image::from_bytes(&b).map_err(|e| e.to_string()))
-    {
+    let img = match millet_asm::load(&path) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("mview: {path}: {e}");
+            eprintln!("{e}");
             return ExitCode::from(2);
         }
     };

@@ -14,7 +14,5 @@ path = "src/main.rs"
 [dependencies]
 millet-core = { path = "../millet-core" }
 millet-sim = { path = "../millet-sim" }
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
-
-[dev-dependencies]
 millet-asm = { path = "../millet-asm" }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
