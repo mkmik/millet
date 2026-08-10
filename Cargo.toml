@@ -1,6 +1,7 @@
 [workspace]
-resolver = "2"
-members = ["millet-core", "millet-asm", "millet-sim"]
+# A virtual manifest does not inherit the resolver from the package edition.
+resolver = "3"
+members = ["millet-core", "millet-asm", "millet-sim", "millet-view"]
 
 [workspace.package]
 version = "0.1.0"

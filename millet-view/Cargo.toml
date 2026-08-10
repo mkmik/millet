@@ -1,0 +1,20 @@
+[package]
+name = "millet-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mview"
+path = "src/main.rs"
+
+# The one crate in the workspace with a dependency. Keeping it out of
+# millet-sim means `msim` and everything that links the simulator stay
+# standard-library only.
+[dependencies]
+millet-core = { path = "../millet-core" }
+millet-sim = { path = "../millet-sim" }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+
+[dev-dependencies]
+millet-asm = { path = "../millet-asm" }
