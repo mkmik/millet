@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use millet_core::isa::{self, AluOp, BrKind, Op, Slot};
-use millet_core::{Config, DataSeg, EbbEntry, FuncEntry, Image, BELT_MAX, SCRATCH_MAX};
+use millet_core::{BELT_MAX, Config, DataSeg, EbbEntry, FuncEntry, Image, SCRATCH_MAX};
 
 use crate::check::{self, Diag, Prediction};
 

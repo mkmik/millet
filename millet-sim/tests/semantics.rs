@@ -1,9 +1,9 @@
 //! Focused tests for the rules the PRD calls out as subtle or high-risk.
 
 use millet_asm::asm;
-use millet_core::isa::{encode, AluOp, BrKind, Op};
+use millet_core::isa::{AluOp, BrKind, Op, encode};
 use millet_core::{Config, EbbEntry, FuncEntry, Image};
-use millet_sim::{run_capture, Options, Stop};
+use millet_sim::{Options, Stop, run_capture};
 
 fn build(src: &str) -> asm::Assembled {
     match asm::assemble(src, &Config::default()) {

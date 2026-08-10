@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use millet_asm::asm;
 use millet_core::Config;
-use millet_sim::{run_capture, Options, Stop};
+use millet_sim::{Options, Stop, run_capture};
 
 fn examples_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

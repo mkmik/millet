@@ -1,7 +1,7 @@
 //! Image to text. Output re-assembles to a byte-identical image.
 
-use millet_core::isa::{decode, format_op, Op, Slot};
 use millet_core::Image;
+use millet_core::isa::{Op, Slot, decode, format_op};
 
 pub fn ebb_name(img: &Image, i: usize) -> String {
     match img.funcs.iter().position(|f| f.ebb as usize == i) {
