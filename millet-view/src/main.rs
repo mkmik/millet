@@ -13,8 +13,12 @@ use std::sync::OnceLock;
 use millet_core::isa::{decode, format_op, Op, Slot};
 use millet_core::{Image, BELT_MAX};
 use millet_sim::{run_capture, Options, Stop};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Margin};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -54,6 +58,14 @@ const KEYS: &[(&str, &str)] = &[
     ("x", "belt values as hex or signed decimal"),
     ("?", "this help"),
     ("q", "quit"),
+    ("", ""),
+    ("wheel", "step; over the memory pane, scroll it"),
+    ("click bar", "seek to that point in the run; drag to scrub"),
+    ("click code", "jump to the next run of that bundle"),
+    (
+        "shift-drag",
+        "select text, as usual — the mouse is captured",
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -610,6 +622,16 @@ struct App {
     /// Base address of the memory window, or None while it follows stores.
     mem_at: Option<u64>,
     code: ListState,
+    /// Where the clickable panes ended up last frame. Widgets draw themselves
+    /// but nothing remembers where they went, so hit-testing needs this.
+    hit: Hit,
+}
+
+#[derive(Default)]
+struct Hit {
+    timeline: Rect,
+    code: Rect,
+    mem: Rect,
 }
 
 impl App {
@@ -944,6 +966,10 @@ impl App {
 
         f.render_widget(self.title_bar(), title);
         f.render_widget(self.timeline(tl.width as usize), tl);
+        self.hit = Hit {
+            timeline: tl,
+            ..Hit::default()
+        };
         f.render_widget(
             Paragraph::new(
                 " \u{2190}\u{2192} step  \u{2191}\u{2193} x10  n/p same bundle  o over  u out  \
@@ -995,6 +1021,8 @@ impl App {
         ])
         .spacing(1)
         .areas(inner);
+        self.hit.code = a_code;
+        self.hit.mem = a_mem;
         self.code.select(Some(self.first[self.rec().bundle]));
         let code = self.code();
         f.render_stateful_widget(code, a_code, &mut self.code);
@@ -1026,6 +1054,46 @@ impl App {
         f.render_widget(self.flight(), a_fl);
         f.render_widget(stack, a_st);
         f.render_widget(scratch, a_sc);
+    }
+
+    fn mouse(&mut self, m: MouseEvent) {
+        let at = Position::new(m.column, m.row);
+        let seek = |i: usize, n: isize| (i as isize + n).clamp(0, self.last() as isize) as usize;
+        match m.kind {
+            // The timeline is already a scrubber; make it one you can grab.
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+                if self.hit.timeline.contains(at) =>
+            {
+                let w = self.hit.timeline.width.max(1) as usize;
+                let col = (m.column - self.hit.timeline.x) as usize;
+                self.i = (col * self.recs.len() / w).min(self.last());
+            }
+            // A click on a bundle asks when it runs next, which is the question
+            // you have when you are staring at a loop body.
+            MouseEventKind::Down(MouseButton::Left) if self.hit.code.contains(at) => {
+                let row = (m.row - self.hit.code.y) as usize;
+                // Row 0 of the pane is its title.
+                let Some(line) = row.checked_sub(1).map(|r| r + self.code.offset()) else {
+                    return;
+                };
+                if let Some((b, _, _)) = self.lines.get(line) {
+                    let hit = |j: &usize| self.recs[*j].bundle == *b;
+                    self.i = (self.i + 1..=self.last())
+                        .find(hit)
+                        .or_else(|| (0..=self.last()).find(hit))
+                        .unwrap_or(self.i);
+                }
+            }
+            MouseEventKind::ScrollDown if self.hit.mem.contains(at) => {
+                self.mem_at = Some(self.mem_base().unwrap_or(0).wrapping_add(16));
+            }
+            MouseEventKind::ScrollUp if self.hit.mem.contains(at) => {
+                self.mem_at = Some(self.mem_base().unwrap_or(0).wrapping_sub(16));
+            }
+            MouseEventKind::ScrollDown => self.i = seek(self.i, 1),
+            MouseEventKind::ScrollUp => self.i = seek(self.i, -1),
+            _ => {}
+        }
     }
 
     /// True to keep going.
@@ -1185,6 +1253,9 @@ fn main() -> ExitCode {
 
     let mut app = App::new(img, recs, title);
     let mut term = ratatui::init();
+    // Capturing the mouse takes drag-to-select away from the terminal; every
+    // terminal I know of gives it back under shift.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let res = loop {
         app.acc.seek(&app.img, &app.recs, app.i);
         if let Err(e) = term.draw(|f| app.render(f)) {
@@ -1196,10 +1267,12 @@ fn main() -> ExitCode {
                     break Ok(());
                 }
             }
+            Ok(Event::Mouse(m)) => app.mouse(m),
             Ok(_) => {}
             Err(e) => break Err(e),
         }
     };
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     match res {
         Ok(()) => ExitCode::SUCCESS,
@@ -1231,6 +1304,7 @@ impl App {
             help: false,
             mem_at: None,
             code: ListState::default(),
+            hit: Hit::default(),
         }
     }
 }
@@ -1329,10 +1403,7 @@ mod tests {
             .join("\n")
     }
 
-    /// The whole screen for a real program, so a broken pane shows up here.
-    /// `MVIEW_DUMP=1 cargo test -p millet-sim --bin mview -- --nocapture` prints it.
-    #[test]
-    fn a_real_program_draws_every_pane() {
+    fn arraysum() -> App {
         let src = std::fs::read_to_string("../examples/arraysum.mil").unwrap();
         let a = millet_asm::asm::assemble(&src, &millet_core::Config::default()).unwrap();
         let run = run_capture(
@@ -1344,7 +1415,60 @@ mod tests {
         );
         let (recs, errs) = parse_trace(&String::from_utf8_lossy(&run.log));
         assert!(errs.is_empty(), "{errs:?}");
-        let mut app = App::new(a.image, recs, "arraysum".into());
+        App::new(a.image, recs, "arraysum".into())
+    }
+
+    fn at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// The panes are only where the last frame put them, so this walks the
+    /// rendered screen and clicks what it reads there.
+    #[test]
+    fn the_mouse_lands_where_it_looks() {
+        let mut app = arraysum();
+        let rows: Vec<String> = screen(&mut app, 118, 34)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let click = |c, r| at(MouseEventKind::Down(MouseButton::Left), c, r);
+
+        let tl = app.hit.timeline;
+        app.mouse(click(tl.x, tl.y));
+        assert_eq!(app.i, 0, "the left end of the bar is the start of the run");
+        app.mouse(click(tl.x + tl.width - 1, tl.y));
+        assert_eq!(app.i, app.last(), "and the right end is the end");
+        app.mouse(at(MouseEventKind::Drag(MouseButton::Left), tl.x, tl.y));
+        assert_eq!(app.i, 0, "dragging scrubs too");
+
+        // Clicking a bundle jumps to the next time it runs.
+        let row = rows
+            .iter()
+            .position(|l| l.contains("10  f   brt"))
+            .expect("the loop branch is on screen");
+        app.mouse(click(app.hit.code.x + 4, row as u16));
+        assert_eq!(app.rec().bundle, 10);
+
+        // The wheel steps, except over the memory dump, where it scrolls.
+        let before = app.i;
+        app.mouse(at(MouseEventKind::ScrollDown, 0, 0));
+        assert_eq!(app.i, before + 1);
+        let mem = app.hit.mem;
+        app.mouse(at(MouseEventKind::ScrollDown, mem.x, mem.y));
+        assert_eq!(app.i, before + 1, "that one belonged to the memory pane");
+        assert_eq!(app.mem_at, Some(0x1010));
+    }
+
+    /// The whole screen for a real program, so a broken pane shows up here.
+    /// `MVIEW_DUMP=1 cargo test -p millet-view -- --nocapture` prints it.
+    #[test]
+    fn a_real_program_draws_every_pane() {
+        let mut app = arraysum();
         app.i = app.recs.iter().position(|r| r.bundle == 9).unwrap();
         let s = screen(&mut app, 118, 34);
         if std::env::var_os("MVIEW_DUMP").is_some() {

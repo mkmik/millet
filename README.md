@@ -86,6 +86,11 @@ the whole run, with the cursor showing where you are in it.
 *this* bundle — the loop-iteration key — `o` steps over a call and `u` out of
 one, `?` lists the rest.
 
+The mouse works too: the wheel steps, clicking the depth bar seeks to that
+point in the run and dragging scrubs it, and clicking a bundle in the code
+jumps to the next time that bundle executes. Text selection needs shift while
+the mouse is captured.
+
 It can also read a trace someone else produced, which is the way to look at a
 run that faulted under different flags:
 
