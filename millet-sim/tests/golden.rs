@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use millet_asm::asm;
 use millet_core::Config;
-use millet_sim::{run_capture, Options};
+use millet_sim::{Options, run_capture};
 
 const PROGRAMS: &[&str] = &[
     "hello",

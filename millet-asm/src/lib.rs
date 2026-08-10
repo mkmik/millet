@@ -4,6 +4,6 @@ pub mod asm;
 pub mod check;
 pub mod disasm;
 
-pub use asm::{assemble, Assembled};
+pub use asm::{Assembled, assemble};
 pub use check::{Diag, Prediction};
 pub use disasm::disassemble;
