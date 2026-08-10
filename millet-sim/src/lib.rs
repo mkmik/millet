@@ -134,6 +134,9 @@ pub struct Machine<'a> {
     opts: Options,
     out: &'a mut dyn Write,
     log: &'a mut dyn Write,
+    /// Bytes this bundle wrote to fd 1, for the JSON trace.
+    // ponytail: fd 1 only; fd 2 shares the terminal with the trace anyway.
+    out_log: Vec<u8>,
 }
 
 impl<'a> Machine<'a> {
@@ -154,6 +157,7 @@ impl<'a> Machine<'a> {
             opts,
             out,
             log,
+            out_log: Vec::new(),
         };
         for seg in &img.data {
             m.store_bytes(seg.addr, &seg.bytes);
@@ -258,6 +262,10 @@ impl<'a> Machine<'a> {
             live: live_in,
         });
         self.stats.bundles += 1;
+        // Taken at entry: a bundle containing a `call` finishes after the whole
+        // callee has run, so `stats.bundles` is no longer this bundle's cycle.
+        let cycle = self.stats.bundles - 1;
+        self.out_log.clear();
         if self.opts.trace {
             let ebb = img
                 .ebb_containing(pc as u32)
@@ -266,8 +274,7 @@ impl<'a> Machine<'a> {
             let inflight = self.frames[depth].pending_summary(t);
             let _ = writeln!(
                 self.log,
-                "[{:>6}] frame {depth} bundle {pc} in {ebb}{inflight}",
-                self.stats.bundles - 1
+                "[{cycle:>6}] frame {depth} bundle {pc} in {ebb}{inflight}"
             );
         }
 
@@ -450,12 +457,14 @@ impl<'a> Machine<'a> {
             }
         }
         retiring.sort_by_key(|p| (p.issue, p.slot));
+        let mut drops: Vec<(u64, Slot, usize)> = Vec::new();
         for p in &retiring {
             for v in &p.vals {
                 self.frames[depth].drop_value(*v);
+                drops.push((*v, p.slot, t - p.issue));
                 if self.opts.trace {
                     let line = format!(
-                        "       drop <- {v}  (slot {} issued at +{})",
+                        "       drop <- {v}  (slot {} issued at {:+})",
                         p.slot.tag(),
                         p.issue as i64 - t as i64
                     );
@@ -513,14 +522,66 @@ impl<'a> Machine<'a> {
         }
         if self.opts.trace_json {
             let f = &self.frames[depth];
-            let belt: Vec<String> = f.belt.iter().map(|v| v.to_string()).collect();
-            let _ = writeln!(
-                self.log,
-                "{{\"cycle\":{},\"frame\":{depth},\"bundle\":{pc},\"live_in\":{live_in},\"live_out\":{},\"belt\":[{}]}}",
-                self.stats.bundles - 1,
+            let nums = |vs: &[u64]| {
+                vs.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let mut rec = format!(
+                "{{\"cycle\":{cycle},\"frame\":{depth},\"bundle\":{pc},\"live_in\":{live_in},\"live_out\":{},\"belt_in\":[{}],\"belt\":[{}]",
                 f.live,
-                belt.join(",")
+                nums(&entry_belt),
+                nums(&f.belt),
             );
+            // Everything below is a per-bundle effect; omitted when it did not
+            // happen, which is most bundles.
+            let list = |name: &str, items: Vec<String>| match items.is_empty() {
+                true => String::new(),
+                false => format!(",\"{name}\":[{}]", items.join(",")),
+            };
+            rec.push_str(&list(
+                "drops",
+                drops
+                    .iter()
+                    .map(|(v, s, age)| {
+                        format!("{{\"v\":{v},\"slot\":\"{}\",\"age\":{age}}}", s.tag())
+                    })
+                    .collect(),
+            ));
+            rec.push_str(&list(
+                "mem",
+                stores
+                    .iter()
+                    .map(|(a, w, v)| format!("{{\"a\":{a},\"w\":{w},\"v\":{v}}}"))
+                    .collect(),
+            ));
+            rec.push_str(&list(
+                "scr",
+                spills
+                    .iter()
+                    .map(|(s, v)| format!("{{\"s\":{s},\"v\":{v}}}"))
+                    .collect(),
+            ));
+            rec.push_str(&list(
+                "flight",
+                f.pending
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{{\"in\":{},\"slot\":\"{}\",\"n\":{}}}",
+                            p.retire_at - t,
+                            p.slot.tag(),
+                            p.vals.len()
+                        )
+                    })
+                    .collect(),
+            ));
+            if !self.out_log.is_empty() {
+                rec.push_str(&format!(",\"out\":{}", json_string(&self.out_log)));
+            }
+            rec.push('}');
+            let _ = writeln!(self.log, "{rec}");
         }
 
         if let Some(res) = returning {
@@ -573,6 +634,9 @@ impl<'a> Machine<'a> {
                     1 => {
                         let _ = self.out.write_all(&bytes);
                         let _ = self.out.flush();
+                        if self.opts.trace_json {
+                            self.out_log.extend_from_slice(&bytes);
+                        }
                         bytes.len()
                     }
                     2 => {
@@ -595,6 +659,24 @@ impl<'a> Machine<'a> {
             other => Err(Stop::Fault(format!("unknown sys code {other}"))),
         }
     }
+}
+
+/// A JSON string literal, quotes included. Invalid UTF-8 becomes U+FFFD.
+fn json_string(bytes: &[u8]) -> String {
+    let mut s = String::from("\"");
+    for c in String::from_utf8_lossy(bytes).chars() {
+        match c {
+            '"' => s.push_str("\\\""),
+            '\\' => s.push_str("\\\\"),
+            '\n' => s.push_str("\\n"),
+            '\t' => s.push_str("\\t"),
+            '\r' => s.push_str("\\r"),
+            c if (c as u32) < 0x20 => s.push_str(&format!("\\u{:04x}", c as u32)),
+            c => s.push(c),
+        }
+    }
+    s.push('"');
+    s
 }
 
 fn assemble_word(bytes: &[u8], sext: bool) -> u64 {
