@@ -1,0 +1,5 @@
+# Pin the formatting rules. Without this, the style edition comes from whatever
+# rustfmt the machine happens to have, and the 2024 rules sort `use` items
+# differently — the same commit passed `cargo fmt --check` on one CI runner and
+# failed on another.
+style_edition = "2021"
