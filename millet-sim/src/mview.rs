@@ -6,14 +6,21 @@
 //! the only accumulated state, and those are replayed from the start.
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::process::{Command, ExitCode, Stdio};
+use std::io::Read;
+use std::process::ExitCode;
 use std::sync::OnceLock;
 
 use millet_core::isa::{decode, format_op, Op, Slot};
 use millet_core::{Image, BELT_MAX};
 use millet_sim::{run_capture, Options, Stop};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout, Margin};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{
+    Block, Borders, Cell, List, ListItem, ListState, Padding, Paragraph, Row, Table, Wrap,
+};
+use ratatui::Frame;
 
 const USAGE: &str = "\
 mview — Millet trace viewer
@@ -502,174 +509,43 @@ fn issuer(img: &Image, recs: &[Rec], i: usize, age: usize, slot: Slot) -> String
 }
 
 // ---------------------------------------------------------------------------
-// Screen plumbing
+// Screen
 // ---------------------------------------------------------------------------
 
 static COLOR: OnceLock<bool> = OnceLock::new();
 
-fn sgr(code: &str, s: &str) -> String {
+/// Every style goes through here so `NO_COLOR` can flatten it.
+fn st(s: Style) -> Style {
     match COLOR.get() {
-        Some(false) => s.to_string(),
-        _ => format!("\x1b[{code}m{s}\x1b[0m"),
+        Some(false) => Style::new(),
+        _ => s,
     }
 }
 
-const DIM: &str = "2";
-const BOLD: &str = "1";
-const HEAD: &str = "1;36";
-const NEW: &str = "1;32";
-const READ: &str = "33";
-const HERE: &str = "1;35";
-const BAR: &str = "7";
-
-fn clip(s: &str, n: usize) -> String {
-    match s.chars().count() > n {
-        true if n > 1 => s.chars().take(n - 1).chain("…".chars()).collect(),
-        true => String::new(),
-        false => s.to_string(),
-    }
+fn dim() -> Style {
+    st(Style::new().add_modifier(Modifier::DIM))
+}
+fn bold() -> Style {
+    st(Style::new().add_modifier(Modifier::BOLD))
+}
+fn head() -> Style {
+    st(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+}
+fn new_val() -> Style {
+    st(Style::new().fg(Color::Green).add_modifier(Modifier::BOLD))
+}
+fn read_mark() -> Style {
+    st(Style::new().fg(Color::Yellow))
+}
+fn here() -> Style {
+    st(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+}
+fn bar() -> Style {
+    st(Style::new().add_modifier(Modifier::REVERSED))
 }
 
-/// A screen row built from styled pieces, tracking its own visible width so the
-/// escape codes never confuse the padding.
-#[derive(Default, Clone)]
-struct Line {
-    s: String,
-    w: usize,
-}
-
-impl Line {
-    fn raw(mut self, t: &str) -> Line {
-        self.w += t.chars().count();
-        self.s.push_str(t);
-        self
-    }
-    fn put(mut self, code: &str, t: &str) -> Line {
-        self.w += t.chars().count();
-        self.s.push_str(&sgr(code, t));
-        self
-    }
-    fn pad(mut self, n: usize) -> Line {
-        while self.w < n {
-            self.s.push(' ');
-            self.w += 1;
-        }
-        self
-    }
-    /// Pad to a column, but never on top of what is already there.
-    fn gap(self, n: usize) -> Line {
-        let n = n.max(self.w + 1);
-        self.pad(n)
-    }
-}
-
-fn line() -> Line {
-    Line::default()
-}
-
-fn header(t: &str) -> Line {
-    line().put(HEAD, t)
-}
-
-struct Term {
-    tty: File,
-}
-
-fn stty(args: &[&str]) {
-    if let Ok(tty) = File::open("/dev/tty") {
-        let _ = Command::new("stty")
-            .args(args)
-            .stdin(Stdio::from(tty))
-            .status();
-    }
-}
-
-impl Term {
-    fn new() -> std::io::Result<Term> {
-        let tty = File::open("/dev/tty")?;
-        stty(&["raw", "-echo"]);
-        print!("\x1b[?1049h\x1b[?25l");
-        let _ = std::io::stdout().flush();
-        Ok(Term { tty })
-    }
-
-    /// Re-asked on every redraw, which is how resizing works without a signal
-    /// handler. `stty` costs a millisecond; a keystroke costs a hundred.
-    fn size(&self) -> (usize, usize) {
-        let out = File::open("/dev/tty")
-            .ok()
-            .and_then(|tty| {
-                Command::new("stty")
-                    .arg("size")
-                    .stdin(Stdio::from(tty))
-                    .output()
-                    .ok()
-            })
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        let mut it = out.split_whitespace().filter_map(|n| n.parse().ok());
-        match (it.next(), it.next()) {
-            (Some(h), Some(w)) => (w, h),
-            _ => (80, 24),
-        }
-    }
-
-    fn key(&mut self) -> Option<Key> {
-        let mut b = [0u8; 1];
-        let mut next = |t: &mut File| t.read(&mut b).ok().filter(|n| *n == 1).map(|_| b[0]);
-        match next(&mut self.tty)? {
-            0x1b => match next(&mut self.tty)? {
-                b'[' | b'O' => match next(&mut self.tty)? {
-                    b'A' => Some(Key::Up),
-                    b'B' => Some(Key::Down),
-                    b'C' => Some(Key::Right),
-                    b'D' => Some(Key::Left),
-                    b'H' => Some(Key::Home),
-                    b'F' => Some(Key::End),
-                    c @ (b'5' | b'6') => {
-                        let _ = next(&mut self.tty); // the trailing `~`
-                        Some(if c == b'5' { Key::PgUp } else { Key::PgDn })
-                    }
-                    _ => Some(Key::Other),
-                },
-                _ => Some(Key::Other),
-            },
-            0x7f => Some(Key::Left),
-            c => Some(Key::Char(c as char)),
-        }
-    }
-}
-
-impl Drop for Term {
-    fn drop(&mut self) {
-        print!("\x1b[?25h\x1b[?1049l");
-        let _ = std::io::stdout().flush();
-        stty(&["-raw", "echo"]);
-    }
-}
-
-enum Key {
-    Char(char),
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
-    PgUp,
-    PgDn,
-    Other,
-}
-
-// ---------------------------------------------------------------------------
-// Panes
-// ---------------------------------------------------------------------------
-
-struct View {
-    hex: bool,
-    help: bool,
-    /// Base address of the memory window, or None while it follows stores.
-    mem_at: Option<u64>,
+fn pane(title: impl Into<String>) -> Block<'static> {
+    Block::new().title(Span::styled(title.into(), head()))
 }
 
 fn fmt_val(v: u64, hex: bool) -> String {
@@ -718,399 +594,496 @@ fn listing(img: &Image) -> (Vec<(usize, bool, String)>, Vec<usize>) {
     (lines, first)
 }
 
-fn code_pane(
-    img: &Image,
-    lines: &[(usize, bool, String)],
-    first: &[usize],
-    recs: &[Rec],
+/// Everything the screen is drawn from. Time is `i`; the rest is what the user
+/// has toggled.
+struct App {
+    img: Image,
+    recs: Vec<Rec>,
+    acc: Acc,
+    lines: Vec<(usize, bool, String)>,
+    first: Vec<usize>,
+    seen: Vec<Option<usize>>,
+    title: String,
     i: usize,
-    seen: &[Option<usize>],
-    w: usize,
-    h: usize,
-) -> Vec<Line> {
-    let cur = recs[i].bundle;
-    let anchor = first.get(cur).copied().unwrap_or(0);
-    let start = anchor
-        .saturating_sub(h / 3)
-        .min(lines.len().saturating_sub(h));
-    let mut out = vec![header(&clip(
-        &format!(
-            "CODE  {}",
-            func_at(img, cur)
-                .map(|f| img.func_label(f))
-                .unwrap_or_default()
-        ),
-        w,
-    ))];
-    for (b, is_header, text) in lines.iter().skip(start).take(h.saturating_sub(1)) {
-        let visited = seen[*b].is_some_and(|f| f <= i);
-        let l = match (*b == cur && !is_header, visited) {
-            (true, _) => line().put(HERE, "\u{25b8} "),
-            (_, true) => line().put(DIM, "\u{00b7} "),
-            _ => line().raw("  "),
-        };
-        let body = clip(text, w.saturating_sub(2));
-        out.push(match (*b == cur, is_header) {
-            (true, false) => l.put(BOLD, &body),
-            (_, true) => l.put(HEAD, &body),
-            _ => l.put(DIM, &body),
-        });
-    }
-    out
+    hex: bool,
+    help: bool,
+    /// Base address of the memory window, or None while it follows stores.
+    mem_at: Option<u64>,
+    code: ListState,
 }
 
-fn belt_pane(img: &Image, recs: &[Rec], i: usize, v: &View, w: usize, h: usize) -> Vec<Line> {
-    let r = &recs[i];
-    let ops = ops_at(img, r.bundle);
+impl App {
+    fn rec(&self) -> &Rec {
+        &self.recs[self.i]
+    }
 
-    // Which slots read which entry position (all reads see the entry belt).
-    let mut reads: Vec<Vec<&str>> = vec![Vec::new(); BELT_MAX];
-    for (slot, op) in &ops {
-        for p in op.belt_reads() {
-            if (p as usize) < BELT_MAX && !reads[p as usize].contains(&slot.tag()) {
-                reads[p as usize].push(slot.tag());
+    fn last(&self) -> usize {
+        self.recs.len() - 1
+    }
+
+    /// Where the memory window sits: pinned, else the last store, else
+    /// whatever `.data` put there.
+    fn mem_base(&self) -> Option<u64> {
+        self.mem_at
+            .or_else(|| self.acc.last_store.map(|a| a & !0xf))
+            .or_else(|| self.acc.mem.keys().next().map(|a| a & !0xf))
+    }
+
+    fn title_bar(&self) -> Paragraph<'static> {
+        let r = self.rec();
+        let ebb = self
+            .img
+            .ebb_containing(r.bundle as u32)
+            .map(|e| self.img.ebb_label(e))
+            .unwrap_or_default();
+        Paragraph::new(format!(
+            " mview  {}   cycle {}/{}   bundle {} in {ebb}   frame {} ",
+            self.title,
+            r.cycle,
+            self.recs[self.last()].cycle,
+            r.bundle,
+            r.frame,
+        ))
+        .style(bar())
+    }
+
+    fn code(&self) -> List<'static> {
+        let cur = self.rec().bundle;
+        let items = self.lines.iter().map(|(b, is_header, text)| {
+            let visited = self.seen[*b].is_some_and(|f| f <= self.i);
+            let gutter = match (*b == cur && !is_header, visited) {
+                (true, _) => Span::styled("\u{25b8} ", here()),
+                (_, true) => Span::styled("\u{00b7} ", dim()),
+                _ => Span::raw("  "),
+            };
+            let style = match (*b == cur, is_header) {
+                (true, false) => bold(),
+                (_, true) => head(),
+                _ => dim(),
+            };
+            ListItem::new(Line::from(vec![gutter, Span::styled(text.clone(), style)]))
+        });
+        let name = func_at(&self.img, cur)
+            .map(|f| self.img.func_label(f))
+            .unwrap_or_default();
+        List::new(items).block(pane(format!("CODE  {name}")))
+    }
+
+    /// Both belts side by side: what the ops read, and what they left behind.
+    fn belt(&self) -> (Table<'static>, usize) {
+        let r = self.rec();
+        let ops = ops_at(&self.img, r.bundle);
+
+        // Which slots read which entry position (all reads see the entry belt).
+        let mut reads: Vec<Vec<&str>> = vec![Vec::new(); BELT_MAX];
+        for (slot, op) in &ops {
+            for p in op.belt_reads() {
+                if (p as usize) < BELT_MAX && !reads[p as usize].contains(&slot.tag()) {
+                    reads[p as usize].push(slot.tag());
+                }
             }
         }
-    }
-
-    // `conform`/`rescue` rewrite the belt last, so each exit position names
-    // where it was picked up from (PRD §7.2).
-    let reshape: Vec<Option<usize>> = match ops.iter().find(|(_, op)| op.is_reshape()) {
-        Some((_, Op::Conform(list))) => list.iter().map(|p| Some(*p as usize)).collect(),
-        Some((_, Op::Rescue(m))) => (0..BELT_MAX)
-            .filter(|i| m & (1 << i) != 0)
-            .map(Some)
-            .collect(),
-        _ => Vec::new(),
-    };
-
-    let top = |live: u16| (0..BELT_MAX).rev().find(|p| live & (1 << p) != 0);
-    let shown = top(r.live_in)
-        .into_iter()
-        .chain(top(r.live_out))
-        .max()
-        .map(|t| t + 1)
-        .unwrap_or(1)
-        .min(BELT_MAX)
-        .min(h.saturating_sub(2).max(1));
-
-    let vw = (0..shown)
-        .flat_map(|p| [fmt_val(r.belt_in[p], v.hex), fmt_val(r.belt[p], v.hex)])
-        .map(|s| s.len())
-        .max()
-        .unwrap_or(4)
-        .clamp(4, 20);
-
-    let mut out = vec![header(&format!("BELT  frame {}", r.frame))
-        .gap(vw)
-        .put(DIM, "entry")
-        .gap(5 + vw + 7 + vw - 4)
-        .put(DIM, "exit")];
-    for p in 0..shown {
-        let mut l = line().put(DIM, &format!(" b{p:<2} "));
-        l = match r.live_in & (1 << p) != 0 {
-            true => l.raw(&format!("{:>vw$}", fmt_val(r.belt_in[p], v.hex))),
-            false => l.put(DIM, &format!("{:>vw$}", "\u{00b7}")),
+        // `conform`/`rescue` rewrite the belt last, so each exit position names
+        // where it was picked up from (PRD §7.2).
+        let reshape: Vec<Option<usize>> = match ops.iter().find(|(_, op)| op.is_reshape()) {
+            Some((_, Op::Conform(list))) => list.iter().map(|p| Some(*p as usize)).collect(),
+            Some((_, Op::Rescue(m))) => (0..BELT_MAX)
+                .filter(|i| m & (1 << i) != 0)
+                .map(Some)
+                .collect(),
+            _ => Vec::new(),
         };
-        l = match reads[p].is_empty() {
-            true => l.raw("      "),
-            false => l.put(
-                READ,
-                &format!("{:>6}", format!("\u{2190}{}", reads[p].join(","))),
-            ),
-        };
-        // Drops land at the bottom of the belt in issue order: the last one
-        // dropped is b0.
-        let from_drop = (r.drops.len() > p).then(|| r.drops.len() - 1 - p);
-        l = match (r.live_out & (1 << p) != 0, from_drop) {
-            (true, Some(_)) => l.put(NEW, &format!(" {:>vw$}", fmt_val(r.belt[p], v.hex))),
-            (true, None) => l.raw(&format!(" {:>vw$}", fmt_val(r.belt[p], v.hex))),
-            (false, _) => l.put(DIM, &format!(" {:>vw$}", "\u{00b7}")),
-        };
-        if let Some(d) = from_drop {
-            let (_, slot, age) = r.drops[d];
-            let op = match age {
-                0 => ops
-                    .iter()
-                    .find(|(s, _)| *s == slot)
-                    .map(|(_, op)| render_op(img, op))
-                    .unwrap_or_default(),
-                _ => issuer(img, recs, i, age, slot),
-            };
-            let note = match age {
-                0 => format!("  {} {op}", slot.tag()),
-                _ => format!("  {} {op}  (-{age})", slot.tag()),
-            };
-            let room = w.saturating_sub(l.w);
-            l = l.put(NEW, &clip(&note, room));
-        } else if let Some(Some(src)) = reshape.get(p) {
-            // Reshape reads the post-drop belt, which is the entry belt only
-            // when nothing landed this bundle.
-            let when = match r.drops.is_empty() {
-                true => "",
-                false => "  (post-drop)",
-            };
-            let room = w.saturating_sub(l.w);
-            l = l.put(READ, &clip(&format!("  \u{2190} b{src}{when}"), room));
-        }
-        out.push(l);
-    }
-    out
-}
 
-fn stacked_panes(img: &Image, recs: &[Rec], i: usize, acc: &Acc, v: &View, w: usize) -> Vec<Line> {
-    let r = &recs[i];
-    let mut out = Vec::new();
+        let top = |live: u16| (0..BELT_MAX).rev().find(|p| live & (1 << p) != 0);
+        let shown = top(r.live_in)
+            .into_iter()
+            .chain(top(r.live_out))
+            .max()
+            .map(|t| t + 1)
+            .unwrap_or(1);
 
-    if !r.flight.is_empty() {
-        out.push(line());
-        out.push(header("IN FLIGHT"));
-        let mut f = r.flight.clone();
-        f.sort();
-        for (bundles, slot, n) in f {
-            let vals = match n {
-                1 => String::new(),
-                n => format!(" ({n} values)"),
+        let cell = |s: String, style: Style| Cell::from(Line::from(s).right_aligned().style(style));
+        let rows = (0..shown).map(|p| {
+            let entry = match r.live_in & (1 << p) != 0 {
+                true => cell(fmt_val(r.belt_in[p], self.hex), Style::new()),
+                false => cell("\u{00b7}".into(), dim()),
             };
-            out.push(line().raw(&clip(
-                &format!(" {:<3} lands in {bundles}{vals}", slot.tag()),
-                w,
-            )));
-        }
-    }
-
-    out.push(line());
-    out.push(header(&format!("STACK  depth {}", acc.stack.len() - 1)));
-    // Deep recursion is mostly the same frame over and over; keep the ends.
-    let hidden = acc.stack.len().saturating_sub(7);
-    for (d, bundle) in acc.stack.iter().enumerate().rev() {
-        if hidden > 0 && d == acc.stack.len() - 6 {
-            out.push(line().put(DIM, &format!("  \u{2026} {hidden} more")));
-        }
-        if hidden > 0 && d > 0 && d <= acc.stack.len() - 6 {
-            continue;
-        }
-        let name = func_at(img, *bundle)
-            .map(|f| img.func_label(f))
-            .unwrap_or_default();
-        let ebb = img
-            .ebb_containing(*bundle as u32)
-            .map(|e| img.ebb_label(e))
-            .filter(|e| *e != name)
-            .map(|e| format!(" in {e}"))
-            .unwrap_or_default();
-        let text = format!(" #{d} {name}  bundle {bundle}{ebb}");
-        out.push(match d == r.frame {
-            true => line().put(BOLD, &clip(&text, w)),
-            false => line().put(DIM, &clip(&text, w)),
+            let read = match reads[p].is_empty() {
+                true => Cell::default(),
+                false => Cell::from(format!("\u{2190}{}", reads[p].join(","))).style(read_mark()),
+            };
+            // Drops land at the bottom of the belt in issue order: the last one
+            // dropped is b0.
+            let from_drop = (r.drops.len() > p).then(|| r.drops.len() - 1 - p);
+            let exit = match (r.live_out & (1 << p) != 0, from_drop) {
+                (true, Some(_)) => cell(fmt_val(r.belt[p], self.hex), new_val()),
+                (true, None) => cell(fmt_val(r.belt[p], self.hex), Style::new()),
+                (false, _) => cell("\u{00b7}".into(), dim()),
+            };
+            let note = match (from_drop, reshape.get(p)) {
+                (Some(d), _) => {
+                    let (_, slot, age) = r.drops[d];
+                    let op = match age {
+                        0 => ops
+                            .iter()
+                            .find(|(s, _)| *s == slot)
+                            .map(|(_, op)| render_op(&self.img, op))
+                            .unwrap_or_default(),
+                        _ => issuer(&self.img, &self.recs, self.i, age, slot),
+                    };
+                    let when = match age {
+                        0 => String::new(),
+                        _ => format!("  (-{age})"),
+                    };
+                    Cell::from(format!("{} {op}{when}", slot.tag())).style(new_val())
+                }
+                // Reshape reads the post-drop belt, which is the entry belt
+                // only when nothing landed this bundle.
+                (None, Some(Some(src))) => Cell::from(match r.drops.is_empty() {
+                    true => format!("\u{2190} b{src}"),
+                    false => format!("\u{2190} b{src}  (post-drop)"),
+                })
+                .style(read_mark()),
+                _ => Cell::default(),
+            };
+            Row::new(vec![
+                Cell::from(format!("b{p}")).style(dim()),
+                entry,
+                read,
+                exit,
+                note,
+            ])
         });
-    }
 
-    let scratch = acc.scratch.get(r.frame);
-    if scratch.is_some_and(|s| !s.is_empty()) {
-        out.push(line());
-        out.push(header("SCRATCH"));
-        let touched: Vec<String> = scratch
-            .unwrap()
-            .iter()
-            .map(|(s, val)| format!("s{s}={}", fmt_val(*val, v.hex)))
-            .collect();
-        for chunk in touched.chunks(4) {
-            out.push(line().raw(&clip(&format!(" {}", chunk.join("  ")), w)));
-        }
-    }
-    out
-}
-
-/// Where the memory window sits: pinned, else the last store, else whatever
-/// `.data` put there.
-fn mem_base(acc: &Acc, v: &View) -> Option<u64> {
-    v.mem_at
-        .or_else(|| acc.last_store.map(|a| a & !0xf))
-        .or_else(|| acc.mem.keys().next().map(|a| a & !0xf))
-}
-
-fn mem_pane(acc: &Acc, v: &View, w: usize, rows: usize) -> Vec<Line> {
-    let bpr: u64 = if w >= 78 { 16 } else { 8 };
-    let Some(base) = mem_base(acc, v) else {
-        return Vec::new();
-    };
-    let follow = match v.mem_at {
-        Some(_) => "",
-        None => "  (following stores)",
-    };
-    let mut out = vec![header(&clip(&format!("MEMORY{follow}"), w))];
-    for row in 0..rows {
-        let addr = base.wrapping_add(bpr * row as u64);
-        let bytes: Vec<Option<u8>> = (0..bpr)
-            .map(|k| acc.mem.get(&(addr + k)).copied())
-            .collect();
-        if bytes.iter().all(|b| b.is_none()) {
-            continue;
-        }
-        let hex: Vec<String> = bytes
-            .iter()
-            .map(|b| match b {
-                Some(b) => format!("{b:02x}"),
-                None => "..".into(),
+        let vw = (0..shown)
+            .flat_map(|p| {
+                [
+                    fmt_val(r.belt_in[p], self.hex),
+                    fmt_val(r.belt[p], self.hex),
+                ]
             })
-            .collect();
-        let ascii: String = bytes
-            .iter()
-            .map(|b| match b {
-                Some(c) if c.is_ascii_graphic() || *c == b' ' => *c as char,
-                _ => '.',
-            })
-            .collect();
-        let hit = acc.last_store.is_some_and(|a| a >= addr && a < addr + bpr);
-        let text = format!(" {addr:#010x}  {}  {ascii}", hex.join(" "));
-        out.push(match hit {
-            true => line().raw(&clip(&text, w)),
-            false => line().put(DIM, &clip(&text, w)),
-        });
-    }
-    out
-}
-
-fn out_pane(acc: &Acc, w: usize, rows: usize) -> Vec<Line> {
-    if acc.out.is_empty() {
-        return Vec::new();
-    }
-    let mut out = vec![header("OUTPUT")];
-    let text: Vec<&str> = acc.out.split('\n').collect();
-    for l in text.iter().rev().take(rows).rev() {
-        out.push(line().raw(&clip(&format!(" {l}"), w)));
-    }
-    out
-}
-
-/// Frame depth over the whole run, one column per screen cell, with the cursor
-/// showing where in it we are.
-fn timeline(recs: &[Rec], i: usize, w: usize) -> Line {
-    let bars = [
-        ' ', '\u{2581}', '\u{2583}', '\u{2585}', '\u{2586}', '\u{2588}',
-    ];
-    let maxd = recs.iter().map(|r| r.frame).max().unwrap_or(0);
-    let n = recs.len();
-    let mut cols = vec![0usize; w];
-    for (c, col) in cols.iter_mut().enumerate() {
-        let lo = c * n / w;
-        let hi = (((c + 1) * n).div_ceil(w)).clamp(lo + 1, n);
-        *col = recs[lo..hi].iter().map(|r| r.frame + 1).max().unwrap_or(0);
-    }
-    let here = i * w / n;
-    let mut l = line();
-    for (c, d) in cols.iter().enumerate() {
-        // Depth 0 is a low track rather than a full block, so the bar reads as
-        // a scrubber even for a program that never calls anything.
-        let step = match maxd {
-            0 => 1,
-            _ => 1 + d.saturating_sub(1) * (bars.len() - 2) / maxd,
-        };
-        let ch = bars[step.min(bars.len() - 1)];
-        let s = ch.to_string();
-        l = match c == here {
-            true => l.put(BAR, &s),
-            false => l.put(DIM, &s),
-        };
-    }
-    l
-}
-
-fn help_pane(w: usize) -> Vec<Line> {
-    let mut out = vec![header("KEYS"), line()];
-    for (k, what) in KEYS {
-        out.push(line().put(BOLD, &format!("  {k:<12}")).raw(&clip(what, w)));
-    }
-    out.push(line());
-    out.push(line().put(DIM, "  any other key returns to the trace"));
-    out
-}
-
-fn draw(
-    img: &Image,
-    recs: &[Rec],
-    i: usize,
-    acc: &Acc,
-    v: &View,
-    lines: &[(usize, bool, String)],
-    first: &[usize],
-    seen: &[Option<usize>],
-    title: &str,
-    w: usize,
-    h: usize,
-) -> String {
-    let r = &recs[i];
-    let ebb = img
-        .ebb_containing(r.bundle as u32)
-        .map(|e| img.ebb_label(e))
-        .unwrap_or_default();
-    let bar = format!(
-        " mview  {title}   cycle {}/{}   bundle {} in {ebb}   frame {} ",
-        r.cycle,
-        recs.last().map(|r| r.cycle).unwrap_or(0),
-        r.bundle,
-        r.frame,
-    );
-    let mut screen = vec![line().put(BAR, &format!("{:<w$}", clip(&bar, w)))];
-
-    if w < 50 || h < 8 {
-        return format!("\x1b[H\x1b[2J mview needs a bigger window ({w}x{h})\r\n");
-    }
-    let body = h.saturating_sub(3);
-    let left_w = (w * 46 / 100).clamp(24, 60).min(w.saturating_sub(20));
-    let right_w = w.saturating_sub(left_w + 3);
-
-    let (mut left, mut right) = if v.help {
-        (help_pane(left_w), Vec::new())
-    } else {
-        let mem = mem_pane(acc, v, left_w, 4);
-        let outp = out_pane(acc, left_w, 3);
-        let code_h = body.saturating_sub(mem.len() + outp.len() + 2);
-        let mut left = code_pane(img, lines, first, recs, i, seen, left_w, code_h);
-        for pane in [mem, outp] {
-            if !pane.is_empty() {
-                left.push(line());
-                left.extend(pane);
-            }
-        }
-        let mut right = belt_pane(img, recs, i, v, right_w, body * 2 / 3);
-        right.extend(stacked_panes(img, recs, i, acc, v, right_w));
-        (left, right)
-    };
-    left.resize(body, line());
-    right.resize(body, line());
-
-    for (l, rt) in left.into_iter().zip(right) {
-        screen.push(
-            l.pad(left_w)
-                .put(DIM, " \u{2502} ")
-                .raw(&rt.s)
-                .pad(w.saturating_sub(1)),
+            .map(|s| s.len() as u16)
+            .max()
+            .unwrap_or(4)
+            .clamp(4, 20);
+        let widths = [
+            Constraint::Length(4),
+            Constraint::Length(vw),
+            Constraint::Length(7),
+            Constraint::Length(vw),
+            Constraint::Min(0),
+        ];
+        let title = format!("BELT  frame {}", r.frame);
+        let table = Table::new(rows, widths).block(
+            pane(title).title(Span::styled("entry \u{2192} exit", dim()).into_right_aligned_line()),
         );
+        (table, shown + 1)
     }
-    screen.push(timeline(recs, i, w));
-    screen.push(line().put(
-        DIM,
-        &clip(
-            " \u{2190}\u{2192} step  \u{2191}\u{2193} x10  n/p same bundle  o over  u out  g/G first/last  ? keys  q quit",
-            w,
-        ),
-    ));
 
-    // Home, then erase each line as it is written and the rest at the end: a
-    // full clear first would flicker. No newline after the last row, which on a
-    // full screen would scroll the title off the top.
-    let mut s = String::from("\x1b[H");
-    for (n, l) in screen.iter().take(h).enumerate() {
-        if n > 0 {
-            s.push_str("\r\n");
-        }
-        s.push_str(&l.s);
-        s.push_str("\x1b[K");
+    fn flight(&self) -> Paragraph<'static> {
+        let mut f = self.rec().flight.clone();
+        f.sort();
+        let text: Vec<Line> = f
+            .iter()
+            .map(|(bundles, slot, n)| {
+                let vals = match n {
+                    1 => String::new(),
+                    n => format!(" ({n} values)"),
+                };
+                Line::raw(format!(" {:<3} lands in {bundles}{vals}", slot.tag()))
+            })
+            .collect();
+        Paragraph::new(text).block(pane("IN FLIGHT"))
     }
-    s.push_str("\x1b[J");
-    s
+
+    fn stack(&self) -> (Paragraph<'static>, usize) {
+        let depth = self.rec().frame;
+        // Deep recursion is mostly the same frame over and over; keep the ends.
+        let hidden = self.acc.stack.len().saturating_sub(7);
+        let mut text = Vec::new();
+        for (d, bundle) in self.acc.stack.iter().enumerate().rev() {
+            if hidden > 0 && d == self.acc.stack.len() - 6 {
+                text.push(Line::styled(format!("  \u{2026} {hidden} more"), dim()));
+            }
+            if hidden > 0 && d > 0 && d <= self.acc.stack.len() - 6 {
+                continue;
+            }
+            let name = func_at(&self.img, *bundle)
+                .map(|f| self.img.func_label(f))
+                .unwrap_or_default();
+            let ebb = self
+                .img
+                .ebb_containing(*bundle as u32)
+                .map(|e| self.img.ebb_label(e))
+                .filter(|e| *e != name)
+                .map(|e| format!(" in {e}"))
+                .unwrap_or_default();
+            let line = format!(" #{d} {name}  bundle {bundle}{ebb}");
+            text.push(match d == depth {
+                true => Line::styled(line, bold()),
+                false => Line::styled(line, dim()),
+            });
+        }
+        let n = text.len();
+        let title = format!("STACK  depth {}", self.acc.stack.len() - 1);
+        (Paragraph::new(text).block(pane(title)), n + 1)
+    }
+
+    fn scratch(&self) -> (Paragraph<'static>, usize) {
+        let touched: Vec<String> = self
+            .acc
+            .scratch
+            .get(self.rec().frame)
+            .into_iter()
+            .flatten()
+            .map(|(s, val)| format!("s{s}={}", fmt_val(*val, self.hex)))
+            .collect();
+        let text: Vec<Line> = touched
+            .chunks(4)
+            .map(|c| Line::raw(format!(" {}", c.join("  "))))
+            .collect();
+        // Nothing spilled in this frame yet: no pane at all, not an empty one.
+        let h = match text.is_empty() {
+            true => 0,
+            false => text.len() + 1,
+        };
+        (Paragraph::new(text).block(pane("SCRATCH")), h)
+    }
+
+    fn memory(&self, rows: usize, wide: bool) -> Paragraph<'static> {
+        let bpr: u64 = if wide { 16 } else { 8 };
+        let text: Vec<Line> = self
+            .mem_base()
+            .into_iter()
+            .flat_map(|base| (0..rows as u64).map(move |row| base.wrapping_add(bpr * row)))
+            .filter_map(|addr| {
+                let bytes: Vec<Option<u8>> = (0..bpr)
+                    .map(|k| self.acc.mem.get(&(addr + k)).copied())
+                    .collect();
+                if bytes.iter().all(|b| b.is_none()) {
+                    return None;
+                }
+                let hex: Vec<String> = bytes
+                    .iter()
+                    .map(|b| match b {
+                        Some(b) => format!("{b:02x}"),
+                        None => "..".into(),
+                    })
+                    .collect();
+                let ascii: String = bytes
+                    .iter()
+                    .map(|b| match b {
+                        Some(c) if c.is_ascii_graphic() || *c == b' ' => *c as char,
+                        _ => '.',
+                    })
+                    .collect();
+                let hit = self
+                    .acc
+                    .last_store
+                    .is_some_and(|a| a >= addr && a < addr + bpr);
+                let line = format!(" {addr:#010x}  {}  {ascii}", hex.join(" "));
+                Some(match hit {
+                    true => Line::raw(line),
+                    false => Line::styled(line, dim()),
+                })
+            })
+            .collect();
+        let follow = match self.mem_at {
+            Some(_) => "",
+            None => "  (following stores)",
+        };
+        Paragraph::new(text).block(pane(format!("MEMORY{follow}")))
+    }
+
+    fn output(&self) -> Paragraph<'static> {
+        Paragraph::new(self.acc.out.clone())
+            .wrap(Wrap { trim: false })
+            .block(pane("OUTPUT"))
+    }
+
+    /// Frame depth over the whole run, one column per screen cell, with the
+    /// cursor showing where in it we are.
+    fn timeline(&self, w: usize) -> Line<'static> {
+        let bars = [
+            ' ', '\u{2581}', '\u{2583}', '\u{2585}', '\u{2586}', '\u{2588}',
+        ];
+        let maxd = self.recs.iter().map(|r| r.frame).max().unwrap_or(0);
+        let n = self.recs.len();
+        let here_col = self.i * w / n;
+        let spans = (0..w).map(|c| {
+            let lo = c * n / w;
+            let hi = (((c + 1) * n).div_ceil(w)).clamp(lo + 1, n);
+            let d = self.recs[lo..hi]
+                .iter()
+                .map(|r| r.frame + 1)
+                .max()
+                .unwrap_or(0);
+            // Depth 0 is a low track rather than a full block, so the bar reads
+            // as a scrubber even for a program that never calls anything.
+            let step = match maxd {
+                0 => 1,
+                _ => 1 + d.saturating_sub(1) * (bars.len() - 2) / maxd,
+            };
+            let sym = bars[step.min(bars.len() - 1)].to_string();
+            match c == here_col {
+                true => Span::styled(sym, bar()),
+                false => Span::styled(sym, dim()),
+            }
+        });
+        Line::from(spans.collect::<Vec<_>>())
+    }
+
+    fn render(&mut self, f: &mut Frame) {
+        let [title, body, tl, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(f.area());
+
+        f.render_widget(self.title_bar(), title);
+        f.render_widget(self.timeline(tl.width as usize), tl);
+        f.render_widget(
+            Paragraph::new(
+                " \u{2190}\u{2192} step  \u{2191}\u{2193} x10  n/p same bundle  o over  u out  \
+                 g/G first/last  ? keys  q quit",
+            )
+            .style(dim()),
+            footer,
+        );
+
+        if self.help {
+            let text: Vec<Line> = KEYS
+                .iter()
+                .map(|(k, what)| {
+                    Line::from(vec![
+                        Span::styled(format!("  {k:<12}"), bold()),
+                        Span::raw(*what),
+                    ])
+                })
+                .collect();
+            f.render_widget(
+                Paragraph::new(text).block(Block::bordered().title(Span::styled("KEYS", head()))),
+                body,
+            );
+            return;
+        }
+
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(46), Constraint::Min(0)]).areas(body);
+        let divider = Block::new()
+            .borders(Borders::RIGHT)
+            .border_style(dim())
+            .padding(Padding::right(1));
+        let inner = divider.inner(left);
+        f.render_widget(divider, left);
+
+        let mem_h = match self.mem_base() {
+            Some(_) => 5,
+            None => 0,
+        };
+        let out_h = match self.acc.out.is_empty() {
+            true => 0,
+            false => 4,
+        };
+        let [a_code, a_mem, a_out] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(mem_h),
+            Constraint::Length(out_h),
+        ])
+        .spacing(1)
+        .areas(inner);
+        self.code.select(Some(self.first[self.rec().bundle]));
+        let code = self.code();
+        f.render_stateful_widget(code, a_code, &mut self.code);
+        f.render_widget(
+            self.memory(mem_h.saturating_sub(1) as usize, inner.width >= 78),
+            a_mem,
+        );
+        f.render_widget(self.output(), a_out);
+
+        // Each pane asks for exactly the rows it needs — a title plus content —
+        // and the layout gives the leftovers to whatever comes last.
+        let (belt, belt_h) = self.belt();
+        let (stack, stack_h) = self.stack();
+        let (scratch, scratch_h) = self.scratch();
+        let flight_h = match self.rec().flight.is_empty() {
+            true => 0,
+            false => self.rec().flight.len() + 1,
+        };
+        let [a_belt, a_fl, a_st, a_sc, _] = Layout::vertical([
+            Constraint::Length(belt_h as u16),
+            Constraint::Length(flight_h as u16),
+            Constraint::Length(stack_h as u16),
+            Constraint::Length(scratch_h as u16),
+            Constraint::Min(0),
+        ])
+        .spacing(1)
+        .areas(right.inner(Margin::new(1, 0)));
+        f.render_widget(belt, a_belt);
+        f.render_widget(self.flight(), a_fl);
+        f.render_widget(stack, a_st);
+        f.render_widget(scratch, a_sc);
+    }
+
+    /// True to keep going.
+    fn key(&mut self, k: KeyEvent) -> bool {
+        if self.help {
+            self.help = false;
+            return k.code != KeyCode::Char('q');
+        }
+        let step = |i: usize, n: isize| (i as isize + n).clamp(0, self.last() as isize) as usize;
+        let scan = |pred: &dyn Fn(&Rec) -> bool, back: bool| {
+            let i = self.i;
+            match back {
+                false => (i + 1..=self.last())
+                    .find(|j| pred(&self.recs[*j]))
+                    .unwrap_or(i),
+                true => (0..i).rev().find(|j| pred(&self.recs[*j])).unwrap_or(i),
+            }
+        };
+        let bundle = self.rec().bundle;
+        let depth = self.rec().frame;
+        self.i = match k.code {
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Char('?') => {
+                self.help = true;
+                self.i
+            }
+            KeyCode::Char('x') => {
+                self.hex = !self.hex;
+                self.i
+            }
+            KeyCode::Char('[') => {
+                self.mem_at = Some(self.mem_base().unwrap_or(0).wrapping_sub(16));
+                self.i
+            }
+            KeyCode::Char(']') => {
+                self.mem_at = Some(self.mem_base().unwrap_or(0).wrapping_add(16));
+                self.i
+            }
+            KeyCode::Char('=') => {
+                self.mem_at = None;
+                self.i
+            }
+            KeyCode::Right | KeyCode::Char('l' | ' ') => step(self.i, 1),
+            KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => step(self.i, -1),
+            KeyCode::Down | KeyCode::Char('L') => step(self.i, 10),
+            KeyCode::Up | KeyCode::Char('H') => step(self.i, -10),
+            KeyCode::PageDown => step(self.i, 100),
+            KeyCode::PageUp => step(self.i, -100),
+            KeyCode::Home | KeyCode::Char('g') => 0,
+            KeyCode::End | KeyCode::Char('G') => self.last(),
+            KeyCode::Char('n') => scan(&|r| r.bundle == bundle, false),
+            KeyCode::Char('p') => scan(&|r| r.bundle == bundle, true),
+            KeyCode::Char('o') => scan(&|r| r.frame <= depth, false),
+            KeyCode::Char('u') => scan(&|r| r.frame < depth, false),
+            _ => self.i,
+        };
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,109 +1182,64 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let (lines, first) = listing(&img);
-    let mut seen: Vec<Option<usize>> = vec![None; img.bundles.len()];
-    for (j, r) in recs.iter().enumerate() {
-        if r.bundle < seen.len() && seen[r.bundle].is_none() {
-            seen[r.bundle] = Some(j);
+    let mut app = App::new(img, recs, title);
+    let mut term = ratatui::init();
+    let res = loop {
+        app.acc.seek(&app.img, &app.recs, app.i);
+        if let Err(e) = term.draw(|f| app.render(f)) {
+            break Err(e);
         }
-    }
-
-    let mut term = match Term::new() {
-        Ok(t) => t,
+        match event::read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                if !app.key(k) {
+                    break Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(e) => break Err(e),
+        }
+    };
+    ratatui::restore();
+    match res {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("mview: no terminal: {e}");
-            return ExitCode::from(2);
+            eprintln!("mview: {e}");
+            ExitCode::from(2)
         }
-    };
-    let mut acc = Acc::default();
-    acc.reset(&img);
-    let mut v = View {
-        hex: false,
-        help: false,
-        mem_at: None,
-    };
-    let mut i = 0usize;
-    let last = recs.len() - 1;
-
-    loop {
-        acc.seek(&img, &recs, i);
-        let (w, h) = term.size();
-        let s = draw(
-            &img, &recs, i, &acc, &v, &lines, &first, &seen, &title, w, h,
-        );
-        print!("{s}");
-        let _ = std::io::stdout().flush();
-
-        let Some(k) = term.key() else { break };
-        let step = |n: isize| (i as isize + n).clamp(0, last as isize) as usize;
-        let scan = |pred: &dyn Fn(&Rec) -> bool, back: bool| match back {
-            false => (i + 1..=last).find(|j| pred(&recs[*j])).unwrap_or(i),
-            true => (0..i).rev().find(|j| pred(&recs[*j])).unwrap_or(i),
-        };
-        if v.help {
-            v.help = false;
-            if matches!(k, Key::Char('q')) {
-                break;
-            }
-            continue;
-        }
-        i = match k {
-            Key::Char('q') | Key::Char('\u{3}') => break,
-            Key::Char('?') => {
-                v.help = true;
-                i
-            }
-            Key::Char('x') => {
-                v.hex = !v.hex;
-                i
-            }
-            Key::Char('[') => {
-                v.mem_at = Some(mem_base(&acc, &v).unwrap_or(0).wrapping_sub(16));
-                i
-            }
-            Key::Char(']') => {
-                v.mem_at = Some(mem_base(&acc, &v).unwrap_or(0).wrapping_add(16));
-                i
-            }
-            Key::Char('=') => {
-                v.mem_at = None;
-                i
-            }
-            Key::Right | Key::Char('l') | Key::Char(' ') => step(1),
-            Key::Left | Key::Char('h') => step(-1),
-            Key::Down | Key::Char('L') => step(10),
-            Key::Up | Key::Char('H') => step(-10),
-            Key::PgDn => step(100),
-            Key::PgUp => step(-100),
-            Key::Home | Key::Char('g') => 0,
-            Key::End | Key::Char('G') => last,
-            Key::Char('n') => {
-                let b = recs[i].bundle;
-                scan(&|r| r.bundle == b, false)
-            }
-            Key::Char('p') => {
-                let b = recs[i].bundle;
-                scan(&|r| r.bundle == b, true)
-            }
-            Key::Char('o') => {
-                let d = recs[i].frame;
-                scan(&|r| r.frame <= d, false)
-            }
-            Key::Char('u') => {
-                let d = recs[i].frame;
-                scan(&|r| r.frame < d, false)
-            }
-            _ => i,
-        };
     }
-    ExitCode::SUCCESS
+}
+
+impl App {
+    fn new(img: Image, recs: Vec<Rec>, title: String) -> App {
+        let (lines, first) = listing(&img);
+        let seen: Vec<Option<usize>> = (0..img.bundles.len())
+            .map(|b| recs.iter().position(|r| r.bundle == b))
+            .collect();
+        let mut acc = Acc::default();
+        acc.reset(&img);
+        App {
+            img,
+            recs,
+            acc,
+            lines,
+            first,
+            seen,
+            title,
+            i: 0,
+            hex: false,
+            help: false,
+            mem_at: None,
+            code: ListState::default(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use millet_core::{DataSeg, EbbEntry, FuncEntry};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn json_reads_what_the_simulator_writes() {
@@ -1385,70 +1313,23 @@ mod tests {
         assert_eq!(acc.scratch[1][&1], 9);
     }
 
-    #[test]
-    fn a_screen_is_drawn_within_its_width() {
-        let img = demo_image();
-        let recs = parse_trace(
-            r#"{"cycle":0,"frame":0,"bundle":0,"live_in":0,"live_out":3,"belt_in":[0,0],"belt":[42,7],"drops":[{"v":7,"slot":"a0","age":0},{"v":42,"slot":"a1","age":0}],"mem":[{"a":4096,"w":1,"v":9}],"out":"hi\n"}"#,
-        )
-        .0;
-        let (lines, first) = listing(&img);
-        let mut acc = Acc::default();
-        acc.reset(&img);
-        acc.seek(&img, &recs, 0);
-        let v = View {
-            hex: false,
-            help: false,
-            mem_at: None,
-        };
-        for w in [80usize, 100, 200] {
-            let s = draw(
-                &img,
-                &recs,
-                0,
-                &acc,
-                &v,
-                &lines,
-                &first,
-                &[Some(0); 4],
-                "t.mimg",
-                w,
-                24,
-            );
-            let rows: Vec<&str> = s.split("\r\n").collect();
-            assert_eq!(rows.len(), 24, "one row per terminal line, no more");
-            for row in rows {
-                let visible = strip_ansi(row);
-                assert!(
-                    visible.chars().count() <= w,
-                    "row `{visible}` is {} wide, over {w}",
-                    visible.chars().count()
-                );
-            }
-            assert!(strip_ansi(&s).contains("42"), "the belt is shown");
-        }
+    fn screen(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        app.acc.seek(&app.img, &app.recs, app.i);
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    fn strip_ansi(s: &str) -> String {
-        let mut out = String::new();
-        let mut it = s.chars();
-        while let Some(c) = it.next() {
-            if c != '\x1b' {
-                out.push(c);
-                continue;
-            }
-            for c in it.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        }
-        out
-    }
-
-    /// The whole screen for a real program, so a broken pane shows up as a
-    /// diff here. `MVIEW_DUMP=1 cargo test -p millet-sim --bin mview -- --nocapture`
-    /// prints it.
+    /// The whole screen for a real program, so a broken pane shows up here.
+    /// `MVIEW_DUMP=1 cargo test -p millet-sim --bin mview -- --nocapture` prints it.
     #[test]
     fn a_real_program_draws_every_pane() {
         let src = std::fs::read_to_string("../examples/arraysum.mil").unwrap();
@@ -1462,27 +1343,12 @@ mod tests {
         );
         let (recs, errs) = parse_trace(&String::from_utf8_lossy(&run.log));
         assert!(errs.is_empty(), "{errs:?}");
-        let img = a.image;
-        let (lines, first) = listing(&img);
-        let seen: Vec<Option<usize>> = (0..img.bundles.len())
-            .map(|b| recs.iter().position(|r| r.bundle == b))
-            .collect();
-        let mut acc = Acc::default();
-        acc.reset(&img);
-        let at = recs.iter().position(|r| r.bundle == 9).unwrap();
-        acc.seek(&img, &recs, at);
-        let v = View {
-            hex: false,
-            help: false,
-            mem_at: None,
-        };
-        let s = draw(
-            &img, &recs, at, &acc, &v, &lines, &first, &seen, "arraysum", 118, 34,
-        );
+        let mut app = App::new(a.image, recs, "arraysum".into());
+        app.i = app.recs.iter().position(|r| r.bundle == 9).unwrap();
+        let s = screen(&mut app, 118, 34);
         if std::env::var_os("MVIEW_DUMP").is_some() {
-            println!("{}", s.replace("\x1b[K", ""));
+            println!("{s}");
         }
-        let plain = strip_ansi(&s);
         for want in [
             "bundle 9 in as_loop",  // the title tracks the record
             "f   rescue 0x0013",    // the code pane found the bundle
@@ -1490,10 +1356,23 @@ mod tests {
             "#1 sum  bundle 9",     // the call stack was reconstructed
             "0x00001000  0a 00 00", // .data seeded the memory pane
         ] {
-            assert!(
-                plain.contains(want),
-                "the screen is missing `{want}`:\n{plain}"
-            );
+            assert!(s.contains(want), "the screen is missing `{want}`:\n{s}");
         }
+    }
+
+    #[test]
+    fn a_narrow_screen_still_draws() {
+        let img = demo_image();
+        let recs = parse_trace(
+            r#"{"cycle":0,"frame":0,"bundle":0,"live_in":0,"live_out":3,"belt_in":[0,0],"belt":[42,7],"drops":[{"v":7,"slot":"a0","age":0},{"v":42,"slot":"a1","age":0}],"mem":[{"a":4096,"w":1,"v":9}],"out":"hi\n"}"#,
+        )
+        .0;
+        let mut app = App::new(img, recs, "t.mimg".into());
+        for (w, h) in [(40u16, 10u16), (80, 24), (200, 60)] {
+            let s = screen(&mut app, w, h);
+            assert_eq!(s.lines().count(), h as usize);
+            assert!(s.lines().all(|l| l.chars().count() == w as usize));
+        }
+        assert!(screen(&mut app, 80, 24).contains("42"), "the belt is shown");
     }
 }
