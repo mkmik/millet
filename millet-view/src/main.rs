@@ -10,9 +10,10 @@ use std::io::Read;
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
-use millet_core::isa::{decode, format_op, Op, Slot};
-use millet_core::{Image, BELT_MAX};
-use millet_sim::{run_capture, Options, Stop};
+use millet_core::isa::{Op, Slot, decode, format_op};
+use millet_core::{BELT_MAX, Image};
+use millet_sim::{Options, Stop, run_capture};
+use ratatui::Frame;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -24,7 +25,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, List, ListItem, ListState, Padding, Paragraph, Row, Table, Wrap,
 };
-use ratatui::Frame;
 
 const USAGE: &str = "\
 mview — Millet trace viewer
@@ -1313,8 +1313,8 @@ impl App {
 mod tests {
     use super::*;
     use millet_core::{DataSeg, EbbEntry, FuncEntry};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn json_reads_what_the_simulator_writes() {
