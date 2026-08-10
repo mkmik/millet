@@ -833,14 +833,16 @@ mod tests {
 
     #[test]
     fn illegal_load_delay_rejected() {
-        assert!(encode(&Op::Load {
-            addr: 0,
-            offset: 0,
-            width: 8,
-            sext: false,
-            delay: 2
-        })
-        .is_err());
+        assert!(
+            encode(&Op::Load {
+                addr: 0,
+                offset: 0,
+                width: 8,
+                sext: false,
+                delay: 2
+            })
+            .is_err()
+        );
         // hand-built word with delay 2
         let w = (OP_LOAD as u32) << 24 | 2 << 16 | 3 << 14;
         assert!(decode(w).is_err());

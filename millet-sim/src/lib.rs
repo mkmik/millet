@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
-use millet_core::isa::{decode, format_op, AluOp, BrKind, Op, Slot};
+use millet_core::isa::{AluOp, BrKind, Op, Slot, decode, format_op};
 use millet_core::{Config, Image};
 
 const PAGE: u64 = 4096;
@@ -108,11 +108,7 @@ impl Frame {
 }
 
 fn mask(k: usize) -> u16 {
-    if k >= 16 {
-        u16::MAX
-    } else {
-        (1u16 << k) - 1
-    }
+    if k >= 16 { u16::MAX } else { (1u16 << k) - 1 }
 }
 
 /// One executed-bundle record, kept for differential testing.
@@ -183,7 +179,7 @@ impl<'a> Machine<'a> {
                 None => {
                     return Err(Stop::Fault(format!(
                         "load from unbacked address {a:#018x} (no .data section covers it, and nothing has been stored there)"
-                    )))
+                    )));
                 }
             }
         }
