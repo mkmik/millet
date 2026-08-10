@@ -355,6 +355,15 @@ version = "0.1.0"
 dependencies = [
  "millet-asm",
  "millet-core",
+]
+
+[[package]]
+name = "millet-view"
+version = "0.1.0"
+dependencies = [
+ "millet-asm",
+ "millet-core",
+ "millet-sim",
  "ratatui",
 ]
 

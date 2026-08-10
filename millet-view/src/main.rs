@@ -988,9 +988,10 @@ impl App {
             false => 4,
         };
         let [a_code, a_mem, a_out] = Layout::vertical([
-            Constraint::Min(0),
-            Constraint::Length(mem_h),
-            Constraint::Length(out_h),
+            // The code always keeps a few rows; memory and output give way.
+            Constraint::Min(4),
+            Constraint::Max(mem_h),
+            Constraint::Max(out_h),
         ])
         .spacing(1)
         .areas(inner);
@@ -1370,6 +1371,9 @@ mod tests {
         let mut app = App::new(img, recs, "t.mimg".into());
         for (w, h) in [(40u16, 10u16), (80, 24), (200, 60)] {
             let s = screen(&mut app, w, h);
+            if std::env::var_os("MVIEW_DUMP").is_some() {
+                println!("{w}x{h}\n{s}\n");
+            }
             assert_eq!(s.lines().count(), h as usize);
             assert!(s.lines().all(|l| l.chars().count() == w as usize));
         }

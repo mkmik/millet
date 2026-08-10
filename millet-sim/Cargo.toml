@@ -12,13 +12,8 @@ path = "src/lib.rs"
 name = "msim"
 path = "src/main.rs"
 
-[[bin]]
-name = "mview"
-path = "src/mview.rs"
-
 [dependencies]
 millet-core = { path = "../millet-core" }
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 
 [dev-dependencies]
 millet-asm = { path = "../millet-asm" }

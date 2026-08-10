@@ -17,6 +17,7 @@ cargo test
 
 cargo run -p millet-asm --bin mas -- examples/fib.mil -o /tmp/fib.mimg
 cargo run -p millet-sim --bin msim -- /tmp/fib.mimg
+cargo run -p millet-view --bin mview -- /tmp/fib.mimg
 ```
 
 Useful flags:
@@ -59,12 +60,12 @@ completion order — `cycle` is the execution order.
 
 ```
  mview  arraysum.mimg   cycle 14/35   bundle 9 in as_loop   frame 1
- CODE  sum                          │ BELT  frame 1        entry   exit
- · .func main(0) -> 0               │  b0     30            30  ← b0
- ·    0  a0  con 5                  │  b1      3             3  ← b1
- ·    1  f   call sum, b1, b0       │  b2     20          4112  ← b4
- · .ebb as_loop(3)                  │  b3      1             ·
- ·    5  a0  con 8                  │  b4   4112             ·
+ CODE  sum                          │ BELT  frame 1       entry → exit
+ · .func main(0) -> 0               │ b0     30      30 ← b0
+ ·    0  a0  con 5                  │ b1      3       3 ← b1
+ ·    1  f   call sum, b1, b0       │ b2     20    4112 ← b4
+ · .ebb as_loop(3)                  │ b3      1       ·
+ ·    5  a0  con 8                  │ b4   4112       ·
  ·       m   load b2, 0, 8, zero, 3 │
  ▸    9  f   rescue 0x0013          │ STACK  depth 1
      10  f   brt b1, as_loop        │  #1 sum  bundle 9 in as_loop
@@ -174,13 +175,18 @@ results is legal (PRD §6.3).
 ```
 millet-core/   ISA definitions, encoding/decoding, the binary image format
 millet-asm/    assembler + static belt model + disassembler   (binary: mas)
-millet-sim/    the simulator and its trace viewer      (binaries: msim, mview)
+millet-sim/    the simulator                                  (binary: msim)
+millet-view/   the trace viewer                              (binary: mview)
 examples/      hand-written .mil programs
 tests/golden/  committed --trace-json traces (MILLET_BLESS=1 to regenerate)
 docs/ISA.md    opcode table, encodings, image format
 ```
 
-No external crates: the whole thing is standard-library Rust.
+Everything that defines the machine — the ISA, the assembler, the simulator —
+is standard-library Rust with no dependencies. `millet-view` is the exception
+and depends on `ratatui`: drawing a screen is a solved problem, and the 140
+lines of width arithmetic and `stty` calls it replaces were the only part of
+this repo that had nothing to do with the Mill.
 
 The machine parameters (belt 16, 4 slots, 64 scratchpad slots, 16-byte
 bundles) live in one `Config` struct in `millet-core`, so the FPGA-oriented

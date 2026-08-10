@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["millet-core", "millet-asm", "millet-sim"]
+members = ["millet-core", "millet-asm", "millet-sim", "millet-view"]
 
 [workspace.package]
 version = "0.1.0"
