@@ -61,10 +61,25 @@ marked unused must be zero — the disassembler rejects a word that sets them.
 | `0x3b` | `rescue` | F    | —       | `mask16` |
 | `0x3c` | `sys`    | F    | 1 (codes 1, 2) | `code` |
 | `0x3d` | `halt`   | F    | —       | — |
+| `0x3e` | `bri`    | F    | —       | `b_target`; unconditional, EBB-table index from the belt |
+| `0x3f` | `calli`  | F    | 1       | `b_target, b_a… -> nres`; function-table index from the belt |
 
 `add`, `sub`, `mul` and the shifts wrap silently. `div`/`rem` fault on a zero
 divisor and on signed `INT_MIN / -1`. Any nonzero value is true for `brt`,
 `brf` and `pick`.
+
+### Indirect transfers
+
+`bri` and `calli` take their target from the belt as a table index, which is
+what `con &label` and `con @func` produce. Two consequences fall out of the
+belt being a static property (PRD §3.2):
+
+- **`calli` carries its own result count**, because the belt has to renumber by
+  an amount the assembler knows and the callee is not one of those. The
+  simulator faults if the callee's declaration disagrees with the call site.
+- **E2 cannot check a `bri` edge**, since the successor set is not known. The
+  simulator checks the entry arity when the branch lands instead. E9 still
+  applies statically: nothing may be in flight at the transfer.
 
 ### Latency convention
 
@@ -91,6 +106,8 @@ conform1..6:     [op:8][b0:4][b1:4][b2:4][b3:4][b4:4][b5:4]
 rescue:          [op:8][mask:16][unused:8]
 sys:             [op:8][code:8][unused:16]
 halt:            [op:8][unused:24]
+bri:             [op:8][b_target:4][unused:20]
+calli:           [op:8][nargs:2][nres:2][b_a:4][b_b:4][b_c:4][b_target:4][unused:4]
 ```
 
 `w` encodes the access width: `0`→1 byte, `1`→2, `2`→4, `3`→8. `ext` is 1 for
@@ -117,13 +134,15 @@ A NaR's 64 data bits are its payload: what failed and the bundle it failed in,
 which is what the fault diagnostic quotes. Propagation copies the payload, so
 the origin survives however far the value travels.
 
-Everything is speculable except three ops, which **realize** what they are
-handed:
+Everything is speculable except the ops below, which **realize** what they are
+handed. Control flow is the common thread: a branch that cannot say where it
+goes has nowhere to defer the question to.
 
 | op | on a None | on a NaR |
 |----|-----------|----------|
 | `store` (value or address) | suppressed: memory is not touched | fault |
 | `brt`/`brf` (condition) | fault | fault |
+| `bri`/`calli` (target) | fault | fault |
 | `sys` (any operand it reads) | fault | fault |
 
 `pick` is the way poison is meant to die: only the selected operand's tag

@@ -133,6 +133,12 @@ Directives: `.func name(arity) -> nres`, `.ebb name(arity)`, `.data addr`
 followed by `.u8/.u16/.u32/.u64/.ascii/.asciiz/.zero`, `.def NAME value`, and
 `.entry name`. Immediates accept decimal, `0x`, `0b`, `'c'`, and `.def` names.
 
+`con &label` and `con @func` put a table index on the belt, which is what
+`bri` and `calli` branch and call through — a jump table, a function pointer,
+an interpreter's dispatch. `calli` writes its result count at the call site
+(`calli b3, b1 -> 1`) because the belt has to renumber by an amount the
+assembler knows and the callee is not one of those.
+
 ### The three things that will bite you
 
 1. **Every drop renumbers the belt.** Two ALU ops in one bundle drop in slot
@@ -195,6 +201,7 @@ Full rules in PRD §8.6; the Mill sources they follow are in `MILL-NOTES.md` §3
 | `fib.mil` | recursive `fib(20)`, plus decimal printing written by hand |
 | `ackermann.mil` | `ack(2,3)`, three-way recursion across five EBBs |
 | `speculate.mil` | a load hoisted above the null test that guards it, `pick` killing the `NaR`, a `None` suppressing a store |
+| `dispatch.mil` | an accumulator VM: `bri` as computed goto, `calli` as function pointer |
 
 ## Static checks
 
@@ -215,6 +222,11 @@ Each check has a stable code and a test in `millet-asm/tests/checks.rs`.
 
 E9 is a warning rather than an error at `retn`, where discarding in-flight
 results is legal (PRD §6.3).
+
+E2 cannot see a `bri` edge and E6 cannot see a `calli`, because neither target
+is known until it executes. The simulator enforces both at the transfer: the
+entry arity on an indirect branch, and the callee's declared result count
+against the one written at the call site.
 
 ## Layout
 

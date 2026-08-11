@@ -292,6 +292,41 @@ fn function_arity_above_three_is_rejected() {
 }
 
 #[test]
+fn calli_result_count_above_three_is_rejected() {
+    assert_error(
+        "
+.func main(0) -> 0
+    a0  con 0
+
+    f   calli b0 -> 4
+
+    f   sys 0
+",
+        "E6",
+    );
+}
+
+/// E2 cannot see an indirect edge, but E9 does not depend on the target.
+#[test]
+fn in_flight_ops_still_caught_at_an_indirect_branch() {
+    assert_error(
+        "
+.func main(0) -> 0
+    a0  con &tgt
+
+    a0  mul b0, b0
+    a1  con 0
+
+    f   bri b1
+
+.ebb tgt(0)
+    f   halt
+",
+        "E9",
+    );
+}
+
+#[test]
 fn a_bundle_may_not_reuse_a_slot() {
     assert_error(
         "

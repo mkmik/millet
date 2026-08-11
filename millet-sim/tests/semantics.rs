@@ -32,6 +32,107 @@ fn stop_of(src: &str) -> Stop {
     run_capture(&a.image, Options::default()).stop
 }
 
+/// Indirect targets are ordinary values, so they can be computed.
+#[test]
+fn calli_selects_its_target_at_run_time() {
+    assert_eq!(
+        exit_code(
+            "
+.func main(0) -> 0
+    a0  con @odd
+    a1  con @even
+                                ; belt: b0=@even b1=@odd
+
+    a0  con 1                   ; the selector
+                                ; belt: b0=1 b1=@even b2=@odd
+
+    a0  pick b0, b1, b2
+
+    f   calli b0 -> 1
+
+    f   sys 0
+
+.func odd(0) -> 1
+    a0  con 3
+
+    f   retn b0
+
+.func even(0) -> 1
+    a0  con 4
+
+    f   retn b0
+"
+        ),
+        4
+    );
+}
+
+/// The callee of a `calli` is not known until it executes, so the belt's
+/// renumbering comes from the count written at the call site (PRD §3.2).
+/// The machine is what enforces that the two agree.
+#[test]
+fn calli_result_count_must_match_the_callee() {
+    match stop_of(
+        "
+.func main(0) -> 0
+    a0  con @two
+
+    f   calli b0 -> 1
+
+    f   sys 0
+
+.func two(0) -> 2
+    a0  con 1
+    a1  con 2
+
+    f   retn b0, b1
+",
+    ) {
+        Stop::Fault(m) => assert!(m.contains("calli declares 1 result"), "{m}"),
+        other => panic!("expected a fault, got {other:?}"),
+    }
+}
+
+/// A target is control flow, and control flow is not speculable (§8.6): a
+/// poisoned one has to resolve where it is used or not at all.
+#[test]
+fn an_indirect_transfer_realizes_a_poisoned_target() {
+    match stop_of(
+        "
+.func main(0) -> 0
+    a0  none
+
+    f   bri b0
+
+.ebb tgt(0)
+    f   halt
+",
+    ) {
+        Stop::Fault(m) => assert!(m.contains("branch in bundle 1 consumed"), "{m}"),
+        other => panic!("expected a fault, got {other:?}"),
+    }
+}
+
+/// A `bri`'s successor set is unknown, so E2 cannot check the edge. The
+/// machine checks the entry arity instead.
+#[test]
+fn indirect_branch_must_deliver_the_entry_arity() {
+    match stop_of(
+        "
+.func main(0) -> 0
+    a0  con &needs_two
+
+    f   bri b0
+
+.ebb needs_two(2)
+    f   sys 0
+",
+    ) {
+        Stop::Fault(m) => assert!(m.contains("needs 2 value(s)"), "{m}"),
+        other => panic!("expected a fault, got {other:?}"),
+    }
+}
+
 /// PRD §7.2 — "the highest-risk semantic rule in the document". A value
 /// computed in the same bundle as the reshape can be rescued, named by the
 /// position it occupies *after* this bundle's drops.
