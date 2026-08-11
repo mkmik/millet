@@ -3,9 +3,11 @@
 
 pub mod image;
 pub mod isa;
+pub mod value;
 
 pub use image::{DataSeg, EbbEntry, FuncEntry, Image};
 pub use isa::{AluOp, BrKind, MAX_ARGS, MAX_CONFORM, Op, Slot};
+pub use value::{NarKind, Tag, Value};
 
 /// Machine parameters (PRD §2). Runtime, not const-generic, so the
 /// FPGA-oriented belt-8 variant is a parameter change rather than a fork.

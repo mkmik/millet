@@ -59,6 +59,11 @@ proposes a default so answering can be a one-word "accept" or a correction.
   positions and scratchpad slots simply read as **zero** in the simulator.
   §8.4's out-of-band taint tracking is dropped; all of A7's propagation
   questions are moot until the metadata extension.
+  *Since answered: the metadata extension happened, and A7's six questions
+  are settled in PRD §8.6 — poison is in the operand rather than out of band,
+  and it is `None`/`NaR` rather than one kind of taint. Question 6 was
+  guessed right (memory holds bits; a store realizes instead of storing a
+  tag), and 2 was too (`pick` keeps only the selected operand's tag).*
 
 ### Adopted proposals (per review: proposals with no counter-argument are simply taken)
 

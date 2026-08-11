@@ -51,3 +51,23 @@ fn every_example_round_trips_byte_identically() {
         );
     }
 }
+
+/// The metadata predicates appear in no example, so the corpus above never
+/// disassembles them.
+#[test]
+fn the_metadata_ops_round_trip_too() {
+    let cfg = Config::default();
+    let src = "
+.func main(0) -> 0
+    a0  none
+
+    a0  isnar b0
+    a1  isnone b0
+
+    f   sys 0
+";
+    let first = asm::assemble(src, &cfg).expect("assembles").image;
+    let text = disasm::disassemble(&first).unwrap();
+    let second = asm::assemble(&text, &cfg).expect("re-assembles").image;
+    assert_eq!(first.to_bytes(), second.to_bytes(), "round trip:\n{text}");
+}

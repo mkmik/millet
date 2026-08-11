@@ -124,3 +124,10 @@ fn ackermann_2_3() {
 fn divmod_returns_two_results() {
     expect_exit("divmod", 142);
 }
+
+/// 42 only if the speculative load's NaR died in the `pick` and the None
+/// suppressed the store; a plain zero there would come back as 0.
+#[test]
+fn speculation_survives_a_null_dereference() {
+    expect_exit("speculate", 42);
+}

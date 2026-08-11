@@ -217,6 +217,15 @@ pub enum Op {
     Con {
         imm: i32,
     },
+    /// Drop a None — a value that is not there (`value.rs`).
+    NoneVal,
+    /// Metadata predicates. These read the tag, so they never propagate it.
+    IsNar {
+        a: u8,
+    },
+    IsNone {
+        a: u8,
+    },
     Load {
         addr: u8,
         offset: i16,
@@ -260,7 +269,12 @@ impl Op {
     pub fn allowed_in(&self, slot: Slot) -> bool {
         match self {
             Op::Nop => true,
-            Op::Alu { .. } | Op::Pick { .. } | Op::Con { .. } => {
+            Op::Alu { .. }
+            | Op::Pick { .. }
+            | Op::Con { .. }
+            | Op::NoneVal
+            | Op::IsNar { .. }
+            | Op::IsNone { .. } => {
                 matches!(slot, Slot::A0 | Slot::A1)
             }
             Op::Load { .. } | Op::Store { .. } | Op::Spill { .. } | Op::Fill { .. } => {
@@ -277,7 +291,11 @@ impl Op {
     pub fn latency(&self) -> Option<u32> {
         match self {
             Op::Alu { op, .. } => Some(op.latency()),
-            Op::Pick { .. } | Op::Con { .. } => Some(1),
+            Op::Pick { .. }
+            | Op::Con { .. }
+            | Op::NoneVal
+            | Op::IsNar { .. }
+            | Op::IsNone { .. } => Some(1),
             Op::Load { delay, .. } => Some(*delay as u32),
             Op::Fill { .. } => Some(3),
             // A call's results retire at the end of the calling bundle.
@@ -299,6 +317,9 @@ impl Op {
             Op::Alu { .. }
             | Op::Pick { .. }
             | Op::Con { .. }
+            | Op::NoneVal
+            | Op::IsNar { .. }
+            | Op::IsNone { .. }
             | Op::Load { .. }
             | Op::Fill { .. } => 1,
             Op::Call { .. } => callee_nres.unwrap_or(0),
@@ -318,6 +339,7 @@ impl Op {
         match self {
             Op::Alu { a, b, .. } => vec![*a, *b],
             Op::Pick { c, t, f } => vec![*c, *t, *f],
+            Op::IsNar { a } | Op::IsNone { a } => vec![*a],
             Op::Load { addr, .. } => vec![*addr],
             Op::Store { addr, val, .. } => vec![*addr, *val],
             Op::Spill { val, .. } => vec![*val],
@@ -366,6 +388,9 @@ impl Op {
 pub const OP_NOP: u8 = 0x00;
 pub const OP_PICK: u8 = 0x14;
 pub const OP_CON: u8 = 0x15;
+pub const OP_NONE: u8 = 0x16;
+pub const OP_ISNAR: u8 = 0x17;
+pub const OP_ISNONE: u8 = 0x18;
 pub const OP_LOAD: u8 = 0x20;
 pub const OP_STORE: u8 = 0x21;
 pub const OP_SPILL: u8 = 0x22;
@@ -440,6 +465,16 @@ pub fn encode(op: &Op) -> Result<u32, DecodeError> {
             }
             put(&mut w, 31, 8, OP_CON as u32);
             put(&mut w, 23, 24, *imm as u32);
+        }
+        Op::NoneVal => put(&mut w, 31, 8, OP_NONE as u32),
+        Op::IsNar { a } | Op::IsNone { a } => {
+            let opc = if matches!(op, Op::IsNar { .. }) {
+                OP_ISNAR
+            } else {
+                OP_ISNONE
+            };
+            put(&mut w, 31, 8, opc as u32);
+            put(&mut w, 23, 4, *a as u32);
         }
         Op::Load {
             addr,
@@ -592,6 +627,19 @@ pub fn decode(word: u32) -> Result<Op, DecodeError> {
         OP_CON => Op::Con {
             imm: sign_extend(rest, 24),
         },
+        OP_NONE => {
+            unused(0x00ff_ffff)?;
+            Op::NoneVal
+        }
+        OP_ISNAR | OP_ISNONE => {
+            unused(0x000f_ffff)?;
+            let a = f(word, 23, 4) as u8;
+            if opc == OP_ISNAR {
+                Op::IsNar { a }
+            } else {
+                Op::IsNone { a }
+            }
+        }
         OP_LOAD => {
             let delay = f(word, 19, 4) as u8;
             if delay < 3 {
@@ -714,6 +762,9 @@ pub fn format_op(op: &Op, ebb: &dyn Fn(u32) -> String, func: &dyn Fn(u16) -> Str
         Op::Alu { op, a, b: bo } => format!("{} b{}, b{}", op.mnemonic(), a, bo),
         Op::Pick { c, t, f } => format!("pick b{c}, b{t}, b{f}"),
         Op::Con { imm } => format!("con {imm}"),
+        Op::NoneVal => "none".into(),
+        Op::IsNar { a } => format!("isnar b{a}"),
+        Op::IsNone { a } => format!("isnone b{a}"),
         Op::Load {
             addr,
             offset,
@@ -780,6 +831,9 @@ mod tests {
             b: 15,
         });
         rt(Op::Pick { c: 1, t: 2, f: 3 });
+        rt(Op::NoneVal);
+        rt(Op::IsNar { a: 15 });
+        rt(Op::IsNone { a: 0 });
         rt(Op::Con { imm: -1234 });
         rt(Op::Con { imm: 0x7fffff });
         rt(Op::Con { imm: -0x800000 });

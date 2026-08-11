@@ -1,0 +1,62 @@
+; What metadata buys you: `p ? *p : 0` with no branch at all.
+;
+; The load is hoisted above the null test that guards it, so it runs even when
+; p is null — and a load that cannot be satisfied drops a NaR instead of
+; stopping the machine. `pick` then throws the NaR away along with the path it
+; came from. Without metadata this needs a branch, and the branch is the whole
+; reason inner loops on a belt machine are hard to schedule.
+;
+; The tail shows the other half: a store whose value is a None is suppressed,
+; which is how a store gets hoisted above its guard too.
+
+.data 0x1000
+.u64 42                         ; the object p might point at
+
+.func main(0) -> 0
+    a0  con 0                   ; a null pointer
+                                ; belt: b0=null
+
+    f   call deref, b0
+                                ; b0=r1 b1=null
+
+    a0  con 0x1000              ; a real one
+                                ; b0=ptr b1=r1 b2=null
+
+    f   call deref, b0
+                                ; b0=r2 b1=ptr b2=r1 b3=null
+
+    a0  add b0, b2              ; 42 + 0
+    a1  none                    ; a value that is not there
+                                ; a0 drops first, so the None lands above it
+                                ; b0=none b1=sum b2=r2 b3=ptr b4=r1 b5=null
+
+    m   store b3, 0, 8, b0      ; suppressed: nothing is written to *ptr
+
+    m   load b3, 0, 8, zero, 3  ; so *ptr still reads 42, not the None's bits
+                                ; retires at the end of +2
+
+    a0  nop
+
+    a0  nop
+                                ; b0=42 b1=none b2=sum b3=r2 b4=ptr
+
+    f   sys 0                   ; exit(42)
+
+; p ? *p : 0, branch-free.
+.func deref(1) -> 1             ; b0=p
+    m   load b0, 0, 8, zero, 3  ; speculative — a NaR if p is null
+    a0  con 0
+                                ; the load is still in flight
+                                ; b0=zero b1=p
+
+    a0  ne b1, b0               ; guard = p != 0
+                                ; b0=guard b1=zero b2=p
+
+    a0  nop
+                                ; the load lands here
+                                ; b0=x b1=guard b2=zero b3=p
+
+    a0  pick b1, b0, b2         ; guard ? x : 0 — this is where the NaR dies
+                                ; b0=r b1=x b2=guard b3=zero b4=p
+
+    f   retn b0

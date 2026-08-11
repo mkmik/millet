@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 
 use millet_core::isa::{Op, Slot, decode, format_op};
-use millet_core::{BELT_MAX, Image};
+use millet_core::{BELT_MAX, Image, Tag};
 use millet_sim::{Options, Stop, run_capture};
 use ratatui::Frame;
 use ratatui::crossterm::event::{
@@ -293,11 +293,14 @@ struct Rec {
     live_out: u16,
     belt_in: [u64; BELT_MAX],
     belt: [u64; BELT_MAX],
+    /// Metadata over the live prefix of each belt: NaR and None (PRD §8.6).
+    tags_in: (u16, u16),
+    tags: (u16, u16),
     /// value, slot, bundles since it was issued.
     drops: Vec<(u64, Slot, usize)>,
     /// address, width, value.
     mem: Vec<(u64, u8, u64)>,
-    scr: Vec<(u8, u64)>,
+    scr: Vec<(u8, u64, Tag)>,
     /// bundles until it lands, slot, number of values.
     flight: Vec<(usize, Slot, usize)>,
     out: String,
@@ -313,6 +316,23 @@ fn belt_of(j: &J) -> [u64; BELT_MAX] {
 
 fn slot_of(j: &J) -> Slot {
     Slot::from_tag(j.text()).unwrap_or(Slot::A0)
+}
+
+/// A `"t"` field, present only on a value that carries metadata.
+fn tag_of(j: &J) -> Tag {
+    match j.at("t").text() {
+        "nar" => Tag::Nar,
+        "none" => Tag::None,
+        _ => Tag::Val,
+    }
+}
+
+fn tag_at(masks: (u16, u16), p: usize) -> Tag {
+    match (masks.0 & (1 << p) != 0, masks.1 & (1 << p) != 0) {
+        (true, _) => Tag::Nar,
+        (_, true) => Tag::None,
+        _ => Tag::Val,
+    }
 }
 
 fn parse_trace(text: &str) -> (Vec<Rec>, Vec<String>) {
@@ -341,6 +361,8 @@ fn parse_trace(text: &str) -> (Vec<Rec>, Vec<String>) {
             live_out: j.at("live_out").num() as u16,
             belt_in: belt_of(j.at("belt_in")),
             belt: belt_of(j.at("belt")),
+            tags_in: (j.at("nar_in").num() as u16, j.at("none_in").num() as u16),
+            tags: (j.at("nar").num() as u16, j.at("none").num() as u16),
             drops: j
                 .at("drops")
                 .arr()
@@ -369,7 +391,7 @@ fn parse_trace(text: &str) -> (Vec<Rec>, Vec<String>) {
                 .at("scr")
                 .arr()
                 .iter()
-                .map(|s| (s.at("s").num() as u8, s.at("v").num() as u64))
+                .map(|s| (s.at("s").num() as u8, s.at("v").num() as u64, tag_of(s)))
                 .collect(),
             flight: j
                 .at("flight")
@@ -402,8 +424,9 @@ struct Acc {
     applied: usize,
     mem: BTreeMap<u64, u8>,
     last_store: Option<u64>,
-    /// Per frame depth — the scratchpad is frame-local (PRD §6.2).
-    scratch: Vec<BTreeMap<u8, u64>>,
+    /// Per frame depth — the scratchpad is frame-local (PRD §6.2), and it
+    /// holds whole operands, metadata included (§8.6).
+    scratch: Vec<BTreeMap<u8, (u64, Tag)>>,
     /// Bundle currently executing at each depth: the call stack.
     stack: Vec<usize>,
     out: String,
@@ -440,8 +463,8 @@ impl Acc {
             }
             self.last_store = Some(*a);
         }
-        for (s, v) in &r.scr {
-            self.scratch[r.frame].insert(*s, *v);
+        for (s, v, tag) in &r.scr {
+            self.scratch[r.frame].insert(*s, (*v, *tag));
         }
         self.out.push_str(&r.out);
     }
@@ -565,6 +588,15 @@ fn fmt_val(v: u64, hex: bool) -> String {
     match hex {
         true => format!("{v:#x}"),
         false => format!("{}", v as i64),
+    }
+}
+
+/// A tagged value shows its tag, not its bits — a NaR's bits are its payload.
+fn fmt_tagged(v: u64, tag: Tag, hex: bool) -> String {
+    match tag {
+        Tag::Val => fmt_val(v, hex),
+        Tag::None => "None".into(),
+        Tag::Nar => "NaR".into(),
     }
 }
 
@@ -726,9 +758,11 @@ impl App {
             .unwrap_or(1);
 
         let cell = |s: String, style: Style| Cell::from(Line::from(s).right_aligned().style(style));
+        let val_in = |p: usize| fmt_tagged(r.belt_in[p], tag_at(r.tags_in, p), self.hex);
+        let val_out = |p: usize| fmt_tagged(r.belt[p], tag_at(r.tags, p), self.hex);
         let rows = (0..shown).map(|p| {
             let entry = match r.live_in & (1 << p) != 0 {
-                true => cell(fmt_val(r.belt_in[p], self.hex), Style::new()),
+                true => cell(val_in(p), Style::new()),
                 false => cell("\u{00b7}".into(), dim()),
             };
             let read = match reads[p].is_empty() {
@@ -739,8 +773,8 @@ impl App {
             // dropped is b0.
             let from_drop = (r.drops.len() > p).then(|| r.drops.len() - 1 - p);
             let exit = match (r.live_out & (1 << p) != 0, from_drop) {
-                (true, Some(_)) => cell(fmt_val(r.belt[p], self.hex), new_val()),
-                (true, None) => cell(fmt_val(r.belt[p], self.hex), Style::new()),
+                (true, Some(_)) => cell(val_out(p), new_val()),
+                (true, None) => cell(val_out(p), Style::new()),
                 (false, _) => cell("\u{00b7}".into(), dim()),
             };
             let note = match (from_drop, reshape.get(p)) {
@@ -779,12 +813,7 @@ impl App {
         });
 
         let vw = (0..shown)
-            .flat_map(|p| {
-                [
-                    fmt_val(r.belt_in[p], self.hex),
-                    fmt_val(r.belt[p], self.hex),
-                ]
-            })
+            .flat_map(|p| [val_in(p), val_out(p)])
             .map(|s| s.len() as u16)
             .max()
             .unwrap_or(4)
@@ -859,7 +888,7 @@ impl App {
             .get(self.rec().frame)
             .into_iter()
             .flatten()
-            .map(|(s, val)| format!("s{s}={}", fmt_val(*val, self.hex)))
+            .map(|(s, (val, tag))| format!("s{s}={}", fmt_tagged(*val, *tag, self.hex)))
             .collect();
         let text: Vec<Line> = touched
             .chunks(4)
@@ -1325,7 +1354,7 @@ mod tests {
         assert_eq!(r.belt[0], 14);
         assert_eq!(r.drops, vec![(14, Slot::F, 0)]);
         assert_eq!(r.mem, vec![(4096, 8, 255)]);
-        assert_eq!(r.scr, vec![(3, 9)]);
+        assert_eq!(r.scr, vec![(3, 9, Tag::Val)]);
         assert_eq!(r.flight, vec![(2, Slot::A0, 1)]);
         assert_eq!(r.out, "hi \"x\"\n");
         // A half-written last line is skipped, not fatal.
@@ -1373,17 +1402,17 @@ mod tests {
         assert_eq!(acc.out, "ab");
         assert_eq!(acc.mem[&0x1000], 1, ".data seeds memory, the store wins");
         assert_eq!(acc.mem[&0x1001], 2);
-        assert_eq!(acc.scratch[0][&1], 5, "the callee's spill is its own");
+        assert_eq!(acc.scratch[0][&1].0, 5, "the callee's spill is its own");
         assert_eq!(acc.stack, vec![3], "the callee frame is gone");
 
         // Seeking back must not leave the forward state behind.
         acc.seek(&img, &recs, 0);
         assert_eq!(acc.out, "");
         assert_eq!(acc.mem[&0x1000], 7);
-        assert_eq!(acc.scratch[0][&1], 5);
+        assert_eq!(acc.scratch[0][&1].0, 5);
         acc.seek(&img, &recs, 2);
         assert_eq!(acc.stack, vec![1, 2]);
-        assert_eq!(acc.scratch[1][&1], 9);
+        assert_eq!(acc.scratch[1][&1].0, 9);
     }
 
     fn screen(app: &mut App, w: u16, h: u16) -> String {
@@ -1480,6 +1509,35 @@ mod tests {
             "0x00001000  0a 00 00", // .data seeded the memory pane
         ] {
             assert!(s.contains(want), "the screen is missing `{want}`:\n{s}");
+        }
+    }
+
+    /// A tagged value is shown as what it is, not as its payload bits.
+    #[test]
+    fn the_belt_names_a_nar_and_a_none() {
+        let src = std::fs::read_to_string("../examples/speculate.mil").unwrap();
+        let a = millet_asm::asm::assemble(&src, &millet_core::Config::default()).unwrap();
+        let run = run_capture(
+            &a.image,
+            Options {
+                trace_json: true,
+                ..Default::default()
+            },
+        );
+        let (recs, errs) = parse_trace(&String::from_utf8_lossy(&run.log));
+        assert!(errs.is_empty(), "{errs:?}");
+        let mut app = App::new(a.image, recs, "speculate".into());
+        for (want, find) in [("NaR", 0), ("None", 1)] {
+            app.i = app
+                .recs
+                .iter()
+                .position(|r| match find {
+                    0 => r.tags.0 != 0,
+                    _ => r.tags.1 != 0,
+                })
+                .unwrap_or_else(|| panic!("no bundle leaves a {want} on the belt"));
+            let s = screen(&mut app, 118, 34);
+            assert!(s.contains(want), "the belt pane should say `{want}`:\n{s}");
         }
     }
 

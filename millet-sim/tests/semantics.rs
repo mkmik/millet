@@ -1,7 +1,7 @@
 //! Focused tests for the rules the PRD calls out as subtle or high-risk.
 
 use millet_asm::asm;
-use millet_core::isa::{AluOp, BrKind, Op, encode};
+use millet_core::isa::{BrKind, Op, encode};
 use millet_core::{Config, EbbEntry, FuncEntry, Image};
 use millet_sim::{Options, Stop, run_capture};
 
@@ -191,8 +191,8 @@ fn call_latency_is_frame_local() {
 }
 
 /// PRD §4 — taking an edge truncates the belt to the target's arity; the
-/// positions above it read as zero. The assembler will not let you read them,
-/// so this one is built by hand.
+/// positions above it read as None (§8.6). The assembler will not let you read
+/// them, so this one is built by hand.
 #[test]
 fn edges_truncate_the_belt_in_hardware() {
     let bundles = vec![
@@ -213,17 +213,7 @@ fn edges_truncate_the_belt_in_hardware() {
             })
             .unwrap(),
         ],
-        [
-            encode(&Op::Alu {
-                op: AluOp::Add,
-                a: 0,
-                b: 1,
-            })
-            .unwrap(),
-            0,
-            0,
-            0,
-        ],
+        [encode(&Op::IsNone { a: 1 }).unwrap(), 0, 0, 0],
         [0, 0, 0, encode(&Op::Sys(0)).unwrap()],
     ];
     let img = Image {
@@ -233,14 +223,17 @@ fn edges_truncate_the_belt_in_hardware() {
         data: vec![],
         entry: 0,
     };
-    // b0=6 survives the edge; b1 (which held 5) reads as zero.
+    // b0=6 survives the edge; b1 (which held 5) is gone, and `isnone` is the
+    // one way to see that without realizing it.
     assert_eq!(
         run_capture(&img, Options::default()).stop,
-        Stop::Exit(6),
-        "arity-1 entry should have zeroed b1"
+        Stop::Exit(1),
+        "arity-1 entry should have truncated b1 away"
     );
 }
 
+/// Still a fault, but a deferred one: the `div` drops a NaR and the `sys`
+/// realizes it (§8.6).
 #[test]
 fn division_by_zero_faults() {
     assert!(matches!(
@@ -273,6 +266,8 @@ fn division_by_zero_faults() {
     ));
 }
 
+/// Likewise deferred — the load itself is speculable, so the `sys` is where
+/// this one lands.
 #[test]
 fn loading_from_an_unbacked_address_faults() {
     assert!(matches!(
@@ -294,6 +289,160 @@ fn loading_from_an_unbacked_address_faults() {
     ));
 }
 
+// -- operand metadata (PRD §8.6) --------------------------------------------
+
+/// A load that cannot be satisfied drops a NaR and carries on; the fault is
+/// raised by the store that realizes it, and says where the NaR came from.
+#[test]
+fn a_store_realizes_a_nar_and_names_its_origin() {
+    let Stop::Fault(msg) = stop_of(
+        "
+.func main(0) -> 0
+    a0  con 0x7f0000            ; nothing is mapped there
+
+    m   load b0, 0, 8, zero, 3
+
+    a0  nop
+
+    a0  nop
+                                ; b0=NaR b1=addr
+
+    m   store b1, 0, 8, b0
+
+    f   sys 0
+",
+    ) else {
+        panic!("the store should have realized the NaR");
+    };
+    assert!(
+        msg.contains("store") && msg.contains("bundle 1") && msg.contains("unbacked"),
+        "the diagnostic should point at the load that failed: {msg}"
+    );
+}
+
+/// The point of the whole exercise: `pick` drops the path not taken, NaR and
+/// all, so a load can be hoisted above the test that guards it.
+#[test]
+fn pick_discards_the_nar_it_did_not_select() {
+    assert_eq!(
+        exit_code(
+            "
+.func main(0) -> 0
+    a0  con 0x7f0000
+    a1  con 7
+                                ; b0=7 b1=addr
+
+    m   load b1, 0, 8, zero, 3
+    a0  con 0                   ; a false guard
+                                ; b0=cond b1=7 b2=addr
+
+    a0  nop
+
+    a0  nop
+                                ; b0=NaR b1=cond b2=7 b3=addr
+
+    a0  pick b1, b0, b2
+
+    f   sys 0
+"
+        ),
+        7
+    );
+}
+
+/// None wins over NaR — a None means the operation was never meant to happen,
+/// so it must not report a fault. The store below is suppressed, not realized.
+#[test]
+fn none_beats_nar_and_suppresses_the_store() {
+    assert_eq!(
+        exit_code(
+            "
+.func main(0) -> 0
+    a0  con 0x7f0000
+
+    m   load b0, 0, 8, zero, 3
+    a0  none
+                                ; b0=None b1=addr
+
+    a0  nop
+
+    a0  nop
+                                ; b0=NaR b1=None b2=addr
+
+    a0  add b0, b1              ; NaR + None = None
+
+    m   store b2, 0, 8, b0      ; suppressed; a NaR here would fault
+
+    a0  con 0
+
+    f   sys 0
+"
+        ),
+        0
+    );
+}
+
+/// The scratchpad holds operands, not bytes: metadata survives a spill/fill
+/// round trip. Memory does not — which is why a store realizes instead.
+#[test]
+fn the_scratchpad_preserves_metadata() {
+    assert_eq!(
+        exit_code(
+            "
+.func main(0) -> 0
+    a0  con 0x7f0000
+
+    m   load b0, 0, 8, zero, 3
+
+    a0  nop
+
+    a0  nop
+                                ; b0=NaR
+
+    m   spill s0, b0
+
+    m   fill s0                 ; latency 3
+
+    a0  nop
+
+    a0  nop
+                                ; b0=the same NaR
+
+    a0  isnar b0
+
+    f   sys 0
+"
+        ),
+        1
+    );
+}
+
+/// Control flow is not speculable either.
+#[test]
+fn a_branch_realizes_a_poisoned_condition() {
+    let stop = stop_of(
+        "
+.func main(0) -> 0
+    a0  con 0x7f0000
+
+    m   load b0, 0, 8, zero, 3
+
+    a0  nop
+
+    a0  nop
+
+    f   brt b0, done
+
+.ebb done(0)
+    f   halt
+",
+    );
+    match stop {
+        Stop::Fault(msg) => assert!(msg.contains("branch"), "{msg}"),
+        other => panic!("a branch on a NaR should fault, got {other:?}"),
+    }
+}
+
 #[test]
 fn halt_is_an_abnormal_stop() {
     assert_eq!(
@@ -308,7 +457,8 @@ fn halt_is_an_abnormal_stop() {
 }
 
 /// PRD §6.1 — the callee's belt and scratchpad start empty; nothing of the
-/// caller's leaks through.
+/// caller's leaks through. "Empty" is now a None rather than a zero (§8.6),
+/// which is what lets the fill say so instead of inventing a value.
 #[test]
 fn a_callee_gets_a_fresh_belt_and_scratchpad() {
     assert_eq!(
@@ -330,9 +480,11 @@ fn a_callee_gets_a_fresh_belt_and_scratchpad() {
 
     a0  nop
 
+    a0  isnone b0
+
     f   retn b0
 "
         ),
-        0
+        1
     );
 }
