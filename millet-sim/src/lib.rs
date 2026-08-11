@@ -415,6 +415,7 @@ impl<'a> Machine<'a> {
 
         // -- slot F ----------------------------------------------------------
         let mut branch_to: Option<usize> = None;
+        let mut branch_indirect = false;
         let mut returning: Option<Vec<Value>> = None;
         let fop = ops[Slot::F.index()].clone();
         if let Some(op) = &fop {
@@ -423,7 +424,48 @@ impl<'a> Machine<'a> {
                 let line = format!("       {:<3} {}", Slot::F.tag(), self.render(op));
                 let _ = writeln!(self.log, "{line}");
             }
+            // An indirect call resolves to its direct equivalent here, once the
+            // belt has been read: the result count written at the call site
+            // must match the callee's declaration, because the assembler
+            // renumbered the belt by that count.
+            let resolved;
+            let op = match op {
+                Op::CallI { nres, target, args } => {
+                    // A target is control flow, and control flow is not
+                    // speculable: a poisoned one resolves here or not at all.
+                    if b(*target).is_poison() {
+                        return Err(realizes("calli", pc, b(*target)));
+                    }
+                    let idx = b(*target).bits;
+                    let t16 = u16::try_from(idx)
+                        .map_err(|_| Stop::Fault(format!("calli target {idx} out of range")))?;
+                    let f = img
+                        .funcs
+                        .get(t16 as usize)
+                        .ok_or_else(|| Stop::Fault(format!("calli target {idx} out of range")))?;
+                    if f.nres != *nres {
+                        return Err(Stop::Fault(format!(
+                            "calli declares {nres} result(s) but `{}` returns {}",
+                            img.func_label(t16 as usize),
+                            f.nres
+                        )));
+                    }
+                    resolved = Op::Call {
+                        target: t16,
+                        args: args.clone(),
+                    };
+                    &resolved
+                }
+                other => other,
+            };
             match op {
+                Op::BrI { target } => {
+                    if b(*target).is_poison() {
+                        return Err(realizes("branch", pc, b(*target)));
+                    }
+                    branch_to = Some(b(*target).bits as usize);
+                    branch_indirect = true;
+                }
                 Op::Br { kind, cond, target } => {
                     // Control flow is not speculable: a poisoned condition has
                     // to be resolved here or not at all.
@@ -692,6 +734,15 @@ impl<'a> Machine<'a> {
                     .ok_or_else(|| Stop::Fault("branch target out of range".into()))?;
                 let (bundle, arity) = (e.bundle as usize, e.arity as usize);
                 let f = &mut self.frames[depth];
+                // E2 cannot see an indirect edge, so the machine checks it.
+                if branch_indirect && f.live & mask(arity) != mask(arity) {
+                    return Err(Stop::Fault(format!(
+                        "indirect branch to `{}` needs {arity} value(s) in b0.., \
+                         but the belt's live mask is {:#06x}",
+                        img.ebb_label(target),
+                        f.live
+                    )));
+                }
                 f.pc = bundle;
                 f.truncate(arity);
             }

@@ -15,6 +15,7 @@ const PROGRAMS: &[&str] = &[
     "divmod",
     // The only one with metadata in it, so it is what pins the tag fields.
     "speculate",
+    "dispatch",
 ];
 
 fn root() -> PathBuf {

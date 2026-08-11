@@ -170,22 +170,22 @@ pub fn assemble(src: &str, cfg: &Config) -> Result<Assembled, AsmError> {
             match &so.target {
                 Target::None => {}
                 Target::Ebb(name) => match ebb_of.get(name) {
-                    Some(&i) => {
-                        if let Op::Br { target, .. } = &mut so.op {
-                            *target = i;
-                        }
-                    }
+                    Some(&i) => match &mut so.op {
+                        Op::Br { target, .. } => *target = i,
+                        Op::Con { imm } => *imm = i as i32,
+                        _ => {}
+                    },
                     None => {
                         p.diags
                             .push(Diag::err("E0", so.line, format!("unknown label `{name}`")))
                     }
                 },
                 Target::Func(name) => match func_of.get(name) {
-                    Some(&i) => {
-                        if let Op::Call { target, .. } = &mut so.op {
-                            *target = i;
-                        }
-                    }
+                    Some(&i) => match &mut so.op {
+                        Op::Call { target, .. } => *target = i,
+                        Op::Con { imm } => *imm = i as i32,
+                        _ => {}
+                    },
                     None => p.diags.push(Diag::err(
                         "E0",
                         so.line,
@@ -528,6 +528,18 @@ impl<'a> Parser<'a> {
                         a: self.belt(args[0], line)?,
                     }
                 }
+                // `con @f` / `con &l` materialize a function or EBB table index,
+                // which is the only way a program can obtain one for `calli`
+                // and `bri`. Resolved in pass 2, like a branch target.
+                "con" if args.len() == 1 && args[0].starts_with(['@', '&']) => {
+                    let name = args[0][1..].trim().to_string();
+                    target = if args[0].starts_with('@') {
+                        Target::Func(name)
+                    } else {
+                        Target::Ebb(name)
+                    };
+                    Op::Con { imm: 0 }
+                }
                 "con" => {
                     want(self, 1)?;
                     let v = self.imm(args[0], line)?;
@@ -616,6 +628,57 @@ impl<'a> Parser<'a> {
                         },
                         cond: self.belt(args[0], line)?,
                         target: 0,
+                    }
+                }
+                "bri" => {
+                    want(self, 1)?;
+                    Op::BrI {
+                        target: self.belt(args[0], line)?,
+                    }
+                }
+                // The callee is not known statically, so the result count has
+                // to be written at the call site: the belt renumbers by a
+                // statically known amount or the whole model collapses.
+                "calli" => {
+                    let Some((head, ret)) = rest.split_once("->") else {
+                        self.err(
+                            "E0",
+                            line,
+                            "`calli` needs a result count: `calli b_t[, args] -> n`".into(),
+                        );
+                        return Err(());
+                    };
+                    let parts: Vec<&str> = head
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let Some(t) = parts.first() else {
+                        self.err("E0", line, "`calli` needs a target".into());
+                        return Err(());
+                    };
+                    if parts.len() - 1 > isa::MAX_ARGS {
+                        self.err(
+                            "E6",
+                            line,
+                            format!("calli passes {} arguments; max 3", parts.len() - 1),
+                        );
+                        return Err(());
+                    }
+                    let nres = self.imm(ret.trim(), line)?;
+                    if !(0..=isa::MAX_ARGS as i64).contains(&nres) {
+                        self.err("E6", line, format!("calli returns {nres} values; max 3"));
+                        return Err(());
+                    }
+                    let tb = self.belt(t, line)?;
+                    let mut a = Vec::new();
+                    for s in &parts[1..] {
+                        a.push(self.belt(s, line)?);
+                    }
+                    Op::CallI {
+                        nres: nres as u8,
+                        target: tb,
+                        args: a,
                     }
                 }
                 "call" => {

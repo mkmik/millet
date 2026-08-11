@@ -251,8 +251,21 @@ pub enum Op {
         cond: u8,
         target: u32,
     },
+    /// Unconditional branch to the EBB-table index held on the belt.
+    BrI {
+        target: u8,
+    },
     Call {
         target: u16,
+        args: Vec<u8>,
+    },
+    /// Call the function-table index held on the belt. The result count is in
+    /// the instruction, not the callee's declaration: the belt has to renumber
+    /// by a statically known amount (PRD §3.2), and the callee is not known
+    /// until the call executes. The simulator faults if the two disagree.
+    CallI {
+        nres: u8,
+        target: u8,
         args: Vec<u8>,
     },
     Retn {
@@ -299,7 +312,7 @@ impl Op {
             Op::Load { delay, .. } => Some(*delay as u32),
             Op::Fill { .. } => Some(3),
             // A call's results retire at the end of the calling bundle.
-            Op::Call { .. } => Some(1),
+            Op::Call { .. } | Op::CallI { .. } => Some(1),
             Op::Sys(code) => {
                 if *code == 0 {
                     None
@@ -323,6 +336,7 @@ impl Op {
             | Op::Load { .. }
             | Op::Fill { .. } => 1,
             Op::Call { .. } => callee_nres.unwrap_or(0),
+            Op::CallI { nres, .. } => *nres as usize,
             Op::Sys(code) => {
                 if *code == 0 {
                     0
@@ -350,7 +364,13 @@ impl Op {
                     vec![*cond]
                 }
             }
+            Op::BrI { target } => vec![*target],
             Op::Call { args, .. } => args.clone(),
+            Op::CallI { target, args, .. } => {
+                let mut v = args.clone();
+                v.push(*target);
+                v
+            }
             Op::Retn { res } => res.clone(),
             // `sys` is the one op that takes fixed positions (PRD §9.5).
             Op::Sys(code) => match code {
@@ -367,13 +387,14 @@ impl Op {
     }
 
     pub fn is_branch(&self) -> bool {
-        matches!(self, Op::Br { .. })
+        matches!(self, Op::Br { .. } | Op::BrI { .. })
     }
 
     /// True if this op ends the EBB unconditionally (no fall-through).
     pub fn ends_flow(&self) -> bool {
         match self {
             Op::Br { kind, .. } => *kind == BrKind::Always,
+            Op::BrI { .. } => true,
             Op::Retn { .. } | Op::Halt => true,
             Op::Sys(0) => true,
             _ => false,
@@ -404,6 +425,8 @@ pub const OP_CONFORM1: u8 = 0x35;
 pub const OP_RESCUE: u8 = 0x3b;
 pub const OP_SYS: u8 = 0x3c;
 pub const OP_HALT: u8 = 0x3d;
+pub const OP_BRI: u8 = 0x3e;
+pub const OP_CALLI: u8 = 0x3f;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct DecodeError(pub String);
@@ -546,6 +569,25 @@ pub fn encode(op: &Op) -> Result<u32, DecodeError> {
                 put(&mut w, 21 - 4 * i as u32, 4, *a as u32);
             }
             put(&mut w, 9, 10, *target as u32);
+        }
+        Op::BrI { target } => {
+            put(&mut w, 31, 8, OP_BRI as u32);
+            put(&mut w, 23, 4, *target as u32);
+        }
+        Op::CallI { nres, target, args } => {
+            if args.len() > MAX_ARGS {
+                return Err(DecodeError("calli takes at most 3 arguments".into()));
+            }
+            if *nres as usize > MAX_ARGS {
+                return Err(DecodeError("calli takes at most 3 results".into()));
+            }
+            put(&mut w, 31, 8, OP_CALLI as u32);
+            put(&mut w, 23, 2, args.len() as u32);
+            put(&mut w, 21, 2, *nres as u32);
+            for (i, a) in args.iter().enumerate() {
+                put(&mut w, 19 - 4 * i as u32, 4, *a as u32);
+            }
+            put(&mut w, 7, 4, *target as u32);
         }
         Op::Retn { res } => {
             if res.len() > MAX_ARGS {
@@ -710,6 +752,30 @@ pub fn decode(word: u32) -> Result<Op, DecodeError> {
                 args,
             }
         }
+        OP_BRI => {
+            unused(0x000f_ffff)?;
+            Op::BrI {
+                target: f(word, 23, 4) as u8,
+            }
+        }
+        OP_CALLI => {
+            unused(0x0000_000f)?;
+            let n = f(word, 23, 2) as usize;
+            let mut args = Vec::new();
+            for i in 0..n {
+                args.push(f(word, 19 - 4 * i as u32, 4) as u8);
+            }
+            for i in n..MAX_ARGS {
+                if f(word, 19 - 4 * i as u32, 4) != 0 {
+                    return Err(DecodeError("unused calli argument field is nonzero".into()));
+                }
+            }
+            Op::CallI {
+                nres: f(word, 21, 2) as u8,
+                target: f(word, 7, 4) as u8,
+                args,
+            }
+        }
         OP_RETN => {
             unused(0x0000_03ff)?;
             let n = f(word, 23, 2) as usize;
@@ -787,12 +853,20 @@ pub fn format_op(op: &Op, ebb: &dyn Fn(u32) -> String, func: &dyn Fn(u16) -> Str
             BrKind::Always => format!("br {}", ebb(*target)),
             _ => format!("{} b{}, {}", kind.mnemonic(), cond, ebb(*target)),
         },
+        Op::BrI { target } => format!("bri b{target}"),
         Op::Call { target, args } => {
             let mut s = format!("call {}", func(*target));
             for a in args {
                 s.push_str(&format!(", {}", b(a)));
             }
             s
+        }
+        Op::CallI { nres, target, args } => {
+            let mut s = format!("calli b{target}");
+            for a in args {
+                s.push_str(&format!(", {}", b(a)));
+            }
+            format!("{s} -> {nres}")
         }
         Op::Retn { res } => {
             let mut s = String::from("retn");
@@ -874,6 +948,17 @@ mod tests {
             args: vec![1, 2, 3],
         });
         rt(Op::Call {
+            target: 0,
+            args: vec![],
+        });
+        rt(Op::BrI { target: 15 });
+        rt(Op::CallI {
+            nres: 3,
+            target: 15,
+            args: vec![1, 2, 3],
+        });
+        rt(Op::CallI {
+            nres: 0,
             target: 0,
             args: vec![],
         });

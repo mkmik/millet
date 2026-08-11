@@ -131,3 +131,8 @@ fn divmod_returns_two_results() {
 fn speculation_survives_a_null_dereference() {
     expect_exit("speculate", 42);
 }
+
+#[test]
+fn dispatch_computes_its_targets() {
+    expect_exit("dispatch", 13);
+}

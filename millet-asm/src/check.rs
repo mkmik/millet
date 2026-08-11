@@ -232,6 +232,24 @@ fn check_ebb(
                     }
                     None => ctx.err("E6", line, "call target index out of range".into()),
                 },
+                // The callee is unknown, so the arity/nres agreement is the
+                // simulator's to enforce; statically, `nres` is simply taken
+                // at its word so the belt stays predictable.
+                Op::CallI { nres, args, .. } => {
+                    if args.len() > millet_core::isa::MAX_ARGS
+                        || *nres as usize > millet_core::isa::MAX_ARGS
+                    {
+                        ctx.err(
+                            "E6",
+                            line,
+                            format!(
+                                "`calli` passes {} argument(s) and takes {nres} result(s); max 3 each",
+                                args.len()
+                            ),
+                        );
+                    }
+                    callee_nres = Some(*nres as usize);
+                }
                 Op::Retn { res } => {
                     let fi = func_of_ebb[ei];
                     if fi == usize::MAX {
@@ -414,8 +432,22 @@ fn check_ebb(
         if let Some(so) = fop {
             match &so.op {
                 Op::Br { kind, target, .. } => {
-                    edge_check(ctx, &belt, &pending, *target as usize, so.line, &ebb_name);
+                    edge_check(
+                        ctx,
+                        &belt,
+                        &pending,
+                        Some(*target as usize),
+                        so.line,
+                        &ebb_name,
+                    );
                     terminated = *kind == BrKind::Always;
+                }
+                // The target set of a `bri` is not known statically, so E2
+                // cannot run on this edge — the simulator enforces the entry
+                // arity instead. E9 still applies.
+                Op::BrI { .. } => {
+                    edge_check(ctx, &belt, &pending, None, so.line, &ebb_name);
+                    terminated = true;
                 }
                 Op::Retn { .. } => {
                     if !pending.is_empty() {
@@ -464,7 +496,7 @@ fn check_ebb(
                 .ebb_at(t as u32 + 1)
                 .expect("bundle after an EBB must start an EBB");
             let line = fop.map(|o| o.line).unwrap_or(bundle.line);
-            edge_check(ctx, &belt, &pending, target, line, &ebb_name);
+            edge_check(ctx, &belt, &pending, Some(target), line, &ebb_name);
             return;
         }
     }
@@ -525,11 +557,13 @@ fn read_check(ctx: &mut Ctx, belt: &Belt, pending: &[Pend], pos: u8, line: usize
     }
 }
 
+/// `target` is `None` for an indirect branch, whose successor set is unknown:
+/// only the in-flight check (E9) applies.
 fn edge_check(
     ctx: &mut Ctx,
     belt: &Belt,
     pending: &[Pend],
-    target: usize,
+    target: Option<usize>,
     line: usize,
     from: &str,
 ) {
@@ -544,6 +578,7 @@ fn edge_check(
             ),
         );
     }
+    let Some(target) = target else { return };
     let Some(te) = ctx.image.ebbs.get(target) else {
         ctx.err("E2", line, "branch target index out of range".into());
         return;
