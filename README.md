@@ -51,9 +51,11 @@ the bundle belongs to and lists what is still in flight and when it lands:
 
 `--trace-json` writes one record per executed bundle. `belt_in`/`belt` are the
 belt as the ops read it and as they left it, `live_in`/`live_out` the matching
-liveness masks; `drops` (value, slot, bundles since issue), `mem` (address,
+liveness masks, and `nar_in`/`none_in`/`nar`/`none` the metadata as masks over
+the same positions; `drops` (value, slot, bundles since issue), `mem` (address,
 width, value), `scr`, `flight` (bundles until it lands) and `out` are the
-bundle's effects, and are omitted when it had none. A bundle containing a
+bundle's effects, and are omitted when it had none. A tagged value carries a
+`"t"` field and its `v` is the tag's payload, not a number worth reading. A bundle containing a
 `call` is written out only once the callee has returned, so records are in
 completion order — `cycle` is the execution order.
 
@@ -143,6 +145,41 @@ followed by `.u8/.u16/.u32/.u64/.ascii/.asciiz/.zero`, `.def NAME value`, and
    3 bundles, a `div` is 8, a load is however many you asked for — all of it
    has to land before the branch.
 
+## Values carry metadata
+
+A belt value is 64 bits **and** a tag: a plain value, a `None`, or a `NaR`.
+That tag is what makes speculation safe, so it is what makes `pick` worth
+having.
+
+An operation that fails drops a `NaR` — "not a result" — instead of stopping
+the machine. A load from an unbacked address, a divide by zero: the failure
+information goes into the value, and the value keeps moving. Anything computed
+from it is a `NaR` too. Nothing goes wrong until a `store`, a branch or a `sys`
+tries to *realize* it, and then the fault names the bundle the `NaR` came from.
+
+A `None` is a value that is not there — `none` drops one, and so does every
+belt position and scratchpad slot nothing has reached yet. It propagates the
+same way and wins over a `NaR`, because a `None` means the operation was never
+meant to happen. A store handed one is simply suppressed.
+
+```
+    m   load b0, 0, 8, zero, 3   ; hoisted above the null test that guards it
+    ...
+    a0  pick b1, b0, b2          ; guard ? *p : 0 — and the NaR dies here
+```
+
+That is the whole point: `pick` keeps only the selected operand's tag, so a
+load can be hoisted above the branch that would have guarded it, and then the
+branch can go. `examples/speculate.mil` dereferences a null pointer with no
+branches at all.
+
+The scratchpad carries metadata too — `spill`/`fill` move whole operands, so a
+spilled `NaR` fills back as the same `NaR`. Memory does not: it holds bytes,
+which is exactly why a `store` has to realize what it is given. `isnar` and
+`isnone` are the only way to look at a tag without realizing it.
+
+Full rules in PRD §8.6; the Mill sources they follow are in `MILL-NOTES.md` §3.
+
 ## Examples
 
 | file | what it shows |
@@ -157,6 +194,7 @@ followed by `.u8/.u16/.u32/.u64/.ascii/.asciiz/.zero`, `.def NAME value`, and
 | `divmod.mil` | a function returning two results |
 | `fib.mil` | recursive `fib(20)`, plus decimal printing written by hand |
 | `ackermann.mil` | `ack(2,3)`, three-way recursion across five EBBs |
+| `speculate.mil` | a load hoisted above the null test that guards it, `pick` killing the `NaR`, a `None` suppressing a store |
 
 ## Static checks
 

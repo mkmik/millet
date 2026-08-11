@@ -19,7 +19,7 @@ This is a learning vehicle and a foundation for later RTL work — not a product
 | Cut | Rationale |
 | --- | --- |
 | Split-stream bidirectional encoding | Orthogonal to execution semantics; pure decode-throughput optimization. Fixed-width bundles instead. |
-| Operand metadata (NaR, None, width tags, vectors) | Big semantic surface. Costs us speculation (see §11), accepted. First thing to add back. |
+| ~~Operand metadata (NaR, None, width tags, vectors)~~ | **NaR and None are in** — the designated first extension, added after v0; see §8.6. Width tags and vectors stay out: no Millet op is width-polymorphic. |
 | Turfs, portals, grants, PLB | OS-level. No protection model at all in v0. |
 | Virtual memory | Flat physical byte-addressed space. |
 | Genasm / member specialization / family compatibility | One concrete member, fixed widths, fixed slot count. |
@@ -40,7 +40,7 @@ Belt · EBBs · explicit static scheduling · multiple slots per instruction · 
 | --- | --- | --- |
 | Belt positions | **16** | 4-bit belt references fit an operand field. Deliberately larger than the 8 planned for the FPGA milestone — hand-written code needs the headroom. |
 | Slots per instruction | **4** | `A0`, `A1` (ALU), `M` (memory), `F` (flow) |
-| Datapath width | **64 bits** | All belt values are 64-bit. No widths, no metadata. |
+| Datapath width | **64 bits** | All belt values are 64-bit. No width metadata; every value carries a status tag (§8.6). |
 | Scratchpad | **64 slots × 8 bytes** per frame | Statically addressed, frame-local |
 | Address space | 2⁶⁴ flat, little-endian | Sparse-backed in the simulator |
 | Instruction bundle | **16 bytes**, 4 × 32-bit slots | Fixed width, no variable-length encoding |
@@ -56,7 +56,7 @@ The belt is a fixed-size queue of 16 values. `b0` is the most recently dropped v
 
 Operands are consumed non-destructively; reading `b3` does not remove it. Values leave the belt only by falling off the far end as newer values are dropped.
 
-**Falling off is silent.** There is no fault for a value expiring. Reading a belt position that has never been written since frame entry yields **zero** (§8.4) — but reading a position holding an unintended stale value is simply a bug the assembler tries to catch statically.
+**Falling off is silent.** There is no fault for a value expiring. Reading a belt position that has never been written since frame entry yields a **None** (§8.4, §8.6) — but reading a position holding an unintended stale value is simply a bug the assembler tries to catch statically.
 
 ### 3.1 Drop ordering
 
@@ -111,7 +111,7 @@ Every slot is 32 bits. Unused slots hold `NOP` (opcode 0x00). Fixed width wastes
 
 | Slot | Ops |
 | --- | --- |
-| A0, A1 | arithmetic, logical, shift, compare, `pick`, `con` |
+| A0, A1 | arithmetic, logical, shift, compare, `pick`, `con`, `none`, `isnar`, `isnone` |
 | M | `load`, `store`, `spill`, `fill` |
 | F | `br`, `brt`, `brf`, `call`, `retn`, `conform`, `rescue`, `sys`, `halt` |
 
@@ -133,7 +133,7 @@ Every operation has a **fixed, architecturally specified latency** measured in b
 
 | Op class | Latency |
 | --- | --- |
-| add, sub, logical, shift, compare, `pick`, `con` | 1 |
+| add, sub, logical, shift, compare, `pick`, `con`, `none`, `isnar`, `isnone` | 1 |
 | mul | 3 |
 | div, rem | 8 |
 | load | **programmer-specified**, 3–15 (§8.2) |
@@ -264,7 +264,9 @@ Spill-to-fill ordering mirrors §8.2 exactly: a spill takes effect at its issuin
 
 ### 8.4 Uninitialized values
 
-There is no poison in v0 — proper poison requires operand metadata (NaR), which is explicitly out of scope. Uninitialized belt positions and scratchpad slots simply read as **zero**, deterministically. Reading one is a bug the assembler tries to catch statically via the liveness and arity checks (§9.3); the machine itself neither tracks nor faults. NaR-style poison arrives with the metadata extension (§11).
+An uninitialized belt position or scratchpad slot reads as a **None** (§8.6) — a value that is not there, rather than a zero pretending to be one. Reading one is still a bug the assembler tries to catch statically via the liveness and arity checks (§9.3); the machine does not fault at the read, but the None propagates and the first store, branch or `sys` that meets it says so.
+
+*(v0 read these as zero. That was always a stand-in for metadata, and it is the one behaviour the metadata extension changed rather than added to — §12.8.)*
 
 ### 8.5 Constants
 
@@ -273,6 +275,35 @@ con imm24            ; sign-extended to 64 bits → 1 result
 ```
 
 24-bit signed immediate. There is no wider-constant pseudo-op in v0: a multi-op expansion would occupy slots and drop belt values the programmer didn't write, crossing the no-inference line of §9.2. Wider constants are built by hand from `con`/`shl`/`or`, or loaded from a constant the programmer lays out in a `.data` section (§10).
+
+### 8.6 Operand metadata
+
+*Added after v0; this is the extension §11 designated.*
+
+Every belt and scratchpad value carries a tag alongside its 64 bits: a plain value, a **None**, or a **NaR**. This is what makes speculation safe, and speculation is the Mill's headline result.
+
+- A **NaR** ("not a result") is what a failed operation drops instead of stopping the machine: a `load` whose address is unbacked, a `div`/`rem` by zero or signed `INT_MIN / -1`. Its 64 data bits are its payload — what failed and the bundle it failed in — so a diagnostic can name the origin however far the value propagated.
+- A **None** is a value that is not there: `none` drops one, and so does every position nothing has reached (§8.4).
+
+**Propagation.** An operation with any poisoned operand computes nothing and drops poison instead: a None if any operand is a None, otherwise that NaR, payload intact. **None wins over NaR** — a None means the operation was never meant to happen, so it must not report a fault. This is the Mill's rule (`MILL-NOTES.md` §3).
+
+**Realization.** Three operations are not speculable and raise what they are handed:
+
+| op | on a None | on a NaR |
+| --- | --- | --- |
+| `store` (value or address) | suppressed — memory is not touched | fault |
+| `brt`/`brf` (condition) | fault | fault |
+| `sys` (any operand it reads) | fault | fault |
+
+Everything else is speculable. `pick` is where poison is meant to die: only the selected operand's tag survives, so a value speculated down the path not taken cannot poison the result — that is what lets a load be hoisted above the test that guards it, and it is why `pick` stops being merely a conditional move. A poisoned *condition* propagates rather than faulting.
+
+**The scratchpad carries metadata; memory does not.** `spill`/`fill` move whole operands, so a spilled NaR fills back as the same NaR, and a speculative value can be parked across a call. Memory holds bytes, which is exactly why `store` has to realize: a suppressed store is how a store gets hoisted above its guard, and a NaR that reaches memory has nowhere left to hide. Verified against the Mill: "the scratch and spill preserves metadata, dealing with belt items and not naked bytes … metadata is preserved in the Scratchpad but discarded again on store" (`MILL-NOTES.md` §3).
+
+**Observing a tag.** `isnar b_x` and `isnone b_x` drop 0/1 and never realize; they are the only way to look at a tag without faulting.
+
+**Not carried:** width and scalarity. On the Mill an operation takes its width and vector count from the operand, so those bits are load-bearing; no Millet operation is width-polymorphic — widths live in the `load`/`store` encodings — so carrying them would be carrying bits nothing reads. Vectors remain out of scope entirely.
+
+**What the assembler checks:** nothing new. A tag is a dynamic property — whether a load faulted is not knowable from the instruction stream — so metadata adds no static check. E1/E4 already reject the reads that would produce an accidental None.
 
 ---
 
@@ -344,7 +375,7 @@ A single `sys` op, minimal by design:
 | 1 | `write(fd=b0, ptr=b1, len=b2)` → bytes written |
 | 2 | `read(fd=b0, ptr=b1, len=b2)` → bytes read |
 
-`sys` is the one op that takes its operands from fixed belt positions (`b0..b2`) rather than naming them. It is legal only in slot F; codes 1 and 2 drop their result with latency 1.
+`sys` is the one op that takes its operands from fixed belt positions (`b0..b2`) rather than naming them. It is legal only in slot F; codes 1 and 2 drop their result with latency 1. IO is not speculable: a poisoned operand faults (§8.6).
 
 Enough to write tests that print. Nothing more.
 
@@ -377,11 +408,13 @@ sys:             [op:8][code:8][unused:16]
 
 ## 11. What we lose, and why it's acceptable
 
-Dropping metadata drops NaR and None, and dropping those drops **speculation**. In real Mill, that's what lets `pick` replace branches wholesale and lets loops run flow-free with speculative loads hoisted above their guarding conditions. Without it, `pick` is just a conditional move and inner loops keep their branches.
+*v0 dropped metadata, and with it NaR, None and **speculation** — the architecture's headline result. It was the designated first extension, and §8.6 is it: loads fault silently, `pick` stops being a conditional move, and `examples/speculate.mil` dereferences a null pointer without a branch in sight. The prediction that it would double the semantic surface was wrong; it cost three opcodes, a tag on the value type, and three ops that had to stop being speculable.*
 
-That's a genuine loss of the architecture's headline result. It's acceptable for v0 because metadata touches every operand path and would double the semantic surface before anything runs. **NaR is the designated first extension** — the belt entry gains a tag bit, loads can fault-silently, and `pick` becomes interesting.
+What is still out:
 
-Second designated extension: full phasing, which is what makes single-bundle loops possible.
+- **Vectors and width metadata.** On the Mill an operation reads its width and element count from the operand; here widths are in the encoding, so the bits would be carried and never read (§8.6).
+- **Full phasing**, which is what makes single-bundle loops possible. Now the second designated extension is the first.
+- **Pickup-form loads** (`MILL-NOTES.md` §1a), which would let a load cross an arg-carrying edge. §12.9.
 
 Separately, and on the tooling rather than the architecture side: the symbolic assembly layer described in §9.2, gated on having written enough raw-offset code to know what it should actually do.
 
@@ -396,7 +429,7 @@ Separately, and on the tooling rather than the architecture side: the symbolic a
 5. **Slot mix.** 2×ALU + M + F is a guess. Real code may want 2 memory slots, or a dedicated `con` slot.
 6. **Fixed 16-byte bundles.** Wasteful; a slot-mask header is the obvious density fix if bundle fetch ever matters.
 7. **Call as unbounded latency.** Fine for a simulator, meaningless for RTL. Revisit before any hardware work.
-8. **Uninitialized-reads-as-zero.** A pragmatic stand-in for NaR; it disappears when metadata arrives.
+8. ~~**Uninitialized-reads-as-zero.**~~ *Settled: it was a stand-in for NaR, and it disappeared when metadata arrived. Uninitialized reads are Nones (§8.4, §8.6).*
 9. **In-flight ops barred from crossing edges.** The strictest reading of the Mill's join rule (§4). The Mill's tag-and-pickup load form would relax it for loads; add it if deferred loads across back-edges turn out to matter in practice.
 
 ---

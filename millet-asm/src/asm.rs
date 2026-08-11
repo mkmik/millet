@@ -512,6 +512,22 @@ impl<'a> Parser<'a> {
                         f: self.belt(args[2], line)?,
                     }
                 }
+                "none" => {
+                    want(self, 0)?;
+                    Op::NoneVal
+                }
+                "isnar" => {
+                    want(self, 1)?;
+                    Op::IsNar {
+                        a: self.belt(args[0], line)?,
+                    }
+                }
+                "isnone" => {
+                    want(self, 1)?;
+                    Op::IsNone {
+                        a: self.belt(args[0], line)?,
+                    }
+                }
                 "con" => {
                     want(self, 1)?;
                     let v = self.imm(args[0], line)?;

@@ -13,6 +13,8 @@ const PROGRAMS: &[&str] = &[
     "pick",
     "arraysum",
     "divmod",
+    // The only one with metadata in it, so it is what pins the tag fields.
+    "speculate",
 ];
 
 fn root() -> PathBuf {

@@ -45,6 +45,9 @@ marked unused must be zero — the disassembler rejects a word that sets them.
 | `0x13` | `leu`    | A    | 1       | unsigned |
 | `0x14` | `pick`   | A    | 1       | `b_c, b_t, b_f`; nonzero condition selects `b_t` |
 | `0x15` | `con`    | A    | 1       | `imm24`, sign-extended to 64 |
+| `0x16` | `none`   | A    | 1       | drops a None |
+| `0x17` | `isnar`  | A    | 1       | `b_a` → 1 if it is a NaR |
+| `0x18` | `isnone` | A    | 1       | `b_a` → 1 if it is a None |
 | `0x20` | `load`   | M    | `delay` | `b_addr, offset, width, ext, delay` |
 | `0x21` | `store`  | M    | —       | `b_addr, offset, width, b_val` |
 | `0x22` | `spill`  | M    | —       | `sN, b_val` |
@@ -76,6 +79,8 @@ readable in bundle `t + 4`. Latencies count bundles of the issuing frame only.
 ALU 2-operand:   [op:8][b_a:4][b_b:4][unused:16]
 pick:            [op:8][b_c:4][b_t:4][b_f:4][unused:12]
 con:             [op:8][imm:24]                          ; signed
+none:            [op:8][unused:24]
+isnar/isnone:    [op:8][b_a:4][unused:20]
 load:            [op:8][b_addr:4][delay:4][w:2][ext:1][offset:13]
 store:           [op:8][b_addr:4][b_val:4][w:2][offset:13][z:1]
 spill/fill:      [op:8][slot:6][b_val:4][unused:14]       ; fill: b_val zero
@@ -92,6 +97,47 @@ halt:            [op:8][unused:24]
 sign extension. Both offsets are signed 13-bit; the store word's low bit is
 reserved zero. Load `delay` values 0–2 are illegal and rejected by both the
 assembler and the disassembler.
+
+## Operand metadata
+
+Every belt and scratchpad value is 64 bits of data **and** a tag: a plain
+value, a **None**, or a **NaR**. The tag is not addressable and there is no op
+that writes one directly other than `none`; it is produced and consumed by the
+rules below (PRD §8.6).
+
+| producer | tag |
+|----------|-----|
+| `none` | None |
+| a `load` whose address is unbacked | NaR |
+| `div`/`rem` by zero, or signed `INT_MIN / -1` | NaR |
+| any op with a poisoned operand | None if one is a None, else that NaR |
+| a belt position nothing has dropped to, or a scratchpad slot nothing has spilled to | None |
+
+A NaR's 64 data bits are its payload: what failed and the bundle it failed in,
+which is what the fault diagnostic quotes. Propagation copies the payload, so
+the origin survives however far the value travels.
+
+Everything is speculable except three ops, which **realize** what they are
+handed:
+
+| op | on a None | on a NaR |
+|----|-----------|----------|
+| `store` (value or address) | suppressed: memory is not touched | fault |
+| `brt`/`brf` (condition) | fault | fault |
+| `sys` (any operand it reads) | fault | fault |
+
+`pick` is the way poison is meant to die: only the selected operand's tag
+survives, so a value speculated down the path not taken cannot poison the
+result. A poisoned *condition* propagates instead — `pick` is speculable too.
+
+`spill`/`fill` are not realizing operations. The scratchpad holds whole
+operands, so a spilled NaR fills back as the same NaR; memory holds bytes, and
+that asymmetry is the reason `store` has to realize. `isnar`/`isnone` read the
+tag without realizing it, and are the only way to observe one without faulting.
+
+Millet carries no width or scalarity metadata: no operation here is
+width-polymorphic — widths live in the `load`/`store` encodings — so those bits
+would be carried and never read.
 
 ## `sys`
 

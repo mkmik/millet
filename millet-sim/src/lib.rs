@@ -4,12 +4,16 @@
 //! it exists at bundle entry; all drops happen at bundle end in
 //! (issuing bundle, slot) order; `conform`/`rescue` rewrite the post-drop
 //! belt last (PRD §3.1, §5.3, §7.2).
+//!
+//! Every belt and scratchpad value carries its metadata tag (PRD §8.6): a
+//! failed operation drops a NaR rather than stopping the machine, and the
+//! fault surfaces at the store, branch or `sys` that realizes it.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
 use millet_core::isa::{AluOp, BrKind, Op, Slot, decode, format_op};
-use millet_core::{Config, Image};
+use millet_core::{Config, Image, NarKind, Tag, Value};
 
 const PAGE: u64 = 4096;
 
@@ -52,14 +56,14 @@ struct Pending {
     retire_at: usize,
     issue: usize,
     slot: Slot,
-    vals: Vec<u64>,
+    vals: Vec<Value>,
 }
 
 #[derive(Clone, Debug)]
 struct Frame {
-    belt: Vec<u64>,
+    belt: Vec<Value>,
     live: u16,
-    scratch: Vec<u64>,
+    scratch: Vec<Value>,
     pending: Vec<Pending>,
     /// Bundles executed in this frame; latencies are frame-local (PRD §6.2).
     time: usize,
@@ -68,17 +72,19 @@ struct Frame {
 
 impl Frame {
     fn new(cfg: &Config, pc: usize) -> Frame {
+        // Nothing has been dropped and nothing spilled, so every position holds
+        // a None — the metadata replacement for v0's reads-as-zero (PRD §12.8).
         Frame {
-            belt: vec![0; cfg.belt],
+            belt: vec![Value::NONE; cfg.belt],
             live: 0,
-            scratch: vec![0; cfg.scratch],
+            scratch: vec![Value::NONE; cfg.scratch],
             pending: Vec::new(),
             time: 0,
             pc,
         }
     }
 
-    fn drop_value(&mut self, v: u64) {
+    fn drop_value(&mut self, v: Value) {
         self.belt.pop();
         self.belt.insert(0, v);
         self.live = ((self.live << 1) | 1) & mask(self.belt.len());
@@ -101,7 +107,7 @@ impl Frame {
 
     fn truncate(&mut self, k: usize) {
         for i in k..self.belt.len() {
-            self.belt[i] = 0;
+            self.belt[i] = Value::NONE;
         }
         self.live &= mask(k);
     }
@@ -109,6 +115,29 @@ impl Frame {
 
 fn mask(k: usize) -> u16 {
     if k >= 16 { u16::MAX } else { (1u16 << k) - 1 }
+}
+
+/// The NaR and None masks over a belt's live prefix — dead positions all read
+/// as None and liveness already says so.
+fn tag_masks(belt: &[Value], live: u16) -> (u16, u16) {
+    let (mut nar, mut none) = (0u16, 0u16);
+    for (i, v) in belt.iter().enumerate() {
+        match v.tag {
+            _ if live & (1 << i) == 0 => {}
+            Tag::Nar => nar |= 1 << i,
+            Tag::None => none |= 1 << i,
+            Tag::Val => {}
+        }
+    }
+    (nar, none)
+}
+
+/// The diagnostic for a non-speculable op meeting a poisoned operand.
+fn realizes(what: &str, pc: usize, v: Value) -> Stop {
+    Stop::Fault(format!(
+        "the {what} in bundle {pc} consumed {}",
+        v.describe()
+    ))
 }
 
 /// One executed-bundle record, kept for differential testing.
@@ -206,7 +235,7 @@ impl<'a> Machine<'a> {
     }
 
     /// Run the topmost frame until it returns; pops it on the way out.
-    fn run_frame(&mut self) -> Result<Vec<u64>, Stop> {
+    fn run_frame(&mut self) -> Result<Vec<Value>, Stop> {
         loop {
             if self.opts.max_bundles != 0 && self.stats.bundles >= self.opts.max_bundles {
                 return Err(Stop::Fault(format!(
@@ -223,7 +252,7 @@ impl<'a> Machine<'a> {
 
     /// Execute one bundle of the topmost frame. `Some(results)` means the
     /// frame executed a `retn`.
-    fn step(&mut self) -> Result<Option<Vec<u64>>, Stop> {
+    fn step(&mut self) -> Result<Option<Vec<Value>>, Stop> {
         let img = self.img;
         let depth = self.frames.len() - 1;
         let pc = self.frames[depth].pc;
@@ -276,7 +305,8 @@ impl<'a> Machine<'a> {
 
         let b = |p: u8| entry_belt[p as usize];
         let mut stores: Vec<(u64, u8, u64)> = Vec::new();
-        let mut spills: Vec<(usize, u64)> = Vec::new();
+        let mut skipped: Vec<u64> = Vec::new();
+        let mut spills: Vec<(usize, Value)> = Vec::new();
 
         // -- slots A0, A1, M -------------------------------------------------
         for slot in [Slot::A0, Slot::A1, Slot::M] {
@@ -289,28 +319,53 @@ impl<'a> Machine<'a> {
                 let _ = writeln!(self.log, "{line}");
             }
             let val = match &op {
-                Op::Alu { op: a, a: x, b: y } => Some(alu(*a, b(*x), b(*y))?),
-                Op::Pick { c, t: x, f: y } => Some(if b(*c) != 0 { b(*x) } else { b(*y) }),
-                Op::Con { imm } => Some(*imm as i64 as u64),
+                Op::Alu { op: a, a: x, b: y } => Some(match Value::poison(&[b(*x), b(*y)]) {
+                    Some(p) => p,
+                    None => alu(*a, b(*x).bits, b(*y).bits, pc),
+                }),
+                // `pick` is what makes speculation pay off: only the selected
+                // operand's tag survives, so the path not taken cannot poison.
+                Op::Pick { c, t: x, f: y } => Some(match b(*c).tag {
+                    Tag::Val if b(*c).bits != 0 => b(*x),
+                    Tag::Val => b(*y),
+                    _ => b(*c),
+                }),
+                Op::Con { imm } => Some(Value::val(*imm as i64 as u64)),
+                Op::NoneVal => Some(Value::NONE),
+                Op::IsNar { a } => Some(Value::val((b(*a).tag == Tag::Nar) as u64)),
+                Op::IsNone { a } => Some(Value::val((b(*a).tag == Tag::None) as u64)),
                 Op::Load {
                     addr,
                     offset,
                     width,
                     sext,
                     ..
-                } => {
-                    let a = b(*addr).wrapping_add(*offset as i64 as u64);
-                    let bytes = self.load_bytes(a, *width as usize)?;
-                    Some(assemble_word(&bytes, *sext))
-                }
+                } => Some(match Value::poison(&[b(*addr)]) {
+                    // A load is speculable: a poisoned address propagates and a
+                    // load that cannot be satisfied drops a NaR (PRD §8.6).
+                    Some(p) => p,
+                    None => {
+                        let a = b(*addr).bits.wrapping_add(*offset as i64 as u64);
+                        match self.load_bytes(a, *width as usize) {
+                            Ok(bytes) => Value::val(assemble_word(&bytes, *sext)),
+                            Err(_) => Value::nar(NarKind::Unbacked, pc),
+                        }
+                    }
+                }),
                 Op::Store {
                     addr,
                     offset,
                     width,
                     val,
                 } => {
-                    let a = b(*addr).wrapping_add(*offset as i64 as u64);
-                    stores.push((a, *width, b(*val)));
+                    // Realization: a None suppresses the store, a NaR raises the
+                    // fault it has been carrying since it was created.
+                    let a = b(*addr).bits.wrapping_add(*offset as i64 as u64);
+                    match Value::poison(&[b(*addr), b(*val)]) {
+                        None => stores.push((a, *width, b(*val).bits)),
+                        Some(p) if p.tag == Tag::None => skipped.push(a),
+                        Some(p) => return Err(realizes("store", pc, p)),
+                    }
                     None
                 }
                 Op::Spill { slot: s, val } => {
@@ -343,6 +398,13 @@ impl<'a> Machine<'a> {
                 let _ = writeln!(self.log, "{line}");
             }
         }
+        if self.opts.trace {
+            for a in &skipped {
+                let _ = writeln!(self.log, "       mem  [{a:#x}] <- (None: store suppressed)");
+            }
+        }
+        // The scratchpad holds operands, not bytes: a spilled NaR fills back as
+        // the same NaR (PRD §8.6).
         for (s, v) in &spills {
             self.frames[depth].scratch[*s] = *v;
             if self.opts.trace {
@@ -353,7 +415,7 @@ impl<'a> Machine<'a> {
 
         // -- slot F ----------------------------------------------------------
         let mut branch_to: Option<usize> = None;
-        let mut returning: Option<Vec<u64>> = None;
+        let mut returning: Option<Vec<Value>> = None;
         let fop = ops[Slot::F.index()].clone();
         if let Some(op) = &fop {
             self.stats.slot_ops[Slot::F.index()] += 1;
@@ -363,10 +425,15 @@ impl<'a> Machine<'a> {
             }
             match op {
                 Op::Br { kind, cond, target } => {
+                    // Control flow is not speculable: a poisoned condition has
+                    // to be resolved here or not at all.
+                    if *kind != BrKind::Always && b(*cond).is_poison() {
+                        return Err(realizes("branch", pc, b(*cond)));
+                    }
                     let take = match kind {
                         BrKind::Always => true,
-                        BrKind::IfTrue => b(*cond) != 0,
-                        BrKind::IfFalse => b(*cond) == 0,
+                        BrKind::IfTrue => b(*cond).bits != 0,
+                        BrKind::IfFalse => b(*cond).bits == 0,
                     };
                     if take {
                         branch_to = Some(*target as usize);
@@ -425,13 +492,20 @@ impl<'a> Machine<'a> {
                     returning = Some(res.iter().map(|r| b(*r)).collect());
                 }
                 Op::Sys(code) => {
-                    let v = self.syscall(*code, b(0), b(1), b(2))?;
+                    // IO is the other non-speculable op: it realizes whatever
+                    // it is handed.
+                    for p in op.belt_reads() {
+                        if b(p).is_poison() {
+                            return Err(realizes("sys", pc, b(p)));
+                        }
+                    }
+                    let v = self.syscall(*code, b(0).bits, b(1).bits, b(2).bits)?;
                     if let Some(v) = v {
                         self.frames[depth].pending.push(Pending {
                             retire_at: t,
                             issue: t,
                             slot: Slot::F,
-                            vals: vec![v],
+                            vals: vec![Value::val(v)],
                         });
                     }
                 }
@@ -453,7 +527,7 @@ impl<'a> Machine<'a> {
             }
         }
         retiring.sort_by_key(|p| (p.issue, p.slot));
-        let mut drops: Vec<(u64, Slot, usize)> = Vec::new();
+        let mut drops: Vec<(Value, Slot, usize)> = Vec::new();
         for p in &retiring {
             for v in &p.vals {
                 self.frames[depth].drop_value(*v);
@@ -474,7 +548,7 @@ impl<'a> Machine<'a> {
             Some(Op::Conform(list)) => {
                 let f = &mut self.frames[depth];
                 let old = f.belt.clone();
-                let mut nb = vec![0u64; old.len()];
+                let mut nb = vec![Value::NONE; old.len()];
                 for (i, p) in list.iter().enumerate() {
                     nb[i] = old[*p as usize];
                 }
@@ -484,7 +558,7 @@ impl<'a> Machine<'a> {
             Some(Op::Rescue(m)) => {
                 let f = &mut self.frames[depth];
                 let old = f.belt.clone();
-                let mut nb = vec![0u64; old.len()];
+                let mut nb = vec![Value::NONE; old.len()];
                 let mut k = 0;
                 for i in 0..old.len() {
                     if m & (1 << i) != 0 {
@@ -507,7 +581,7 @@ impl<'a> Machine<'a> {
                 Some(top) => (0..=top)
                     .map(|i| {
                         if f.live & (1 << i) != 0 {
-                            format!("b{i}={}", f.belt[i] as i64)
+                            format!("b{i}={}", f.belt[i])
                         } else {
                             format!("b{i}=-")
                         }
@@ -518,9 +592,9 @@ impl<'a> Machine<'a> {
         }
         if self.opts.trace_json {
             let f = &self.frames[depth];
-            let nums = |vs: &[u64]| {
+            let nums = |vs: &[Value]| {
                 vs.iter()
-                    .map(|v| v.to_string())
+                    .map(|v| v.bits.to_string())
                     .collect::<Vec<_>>()
                     .join(",")
             };
@@ -536,12 +610,32 @@ impl<'a> Machine<'a> {
                 true => String::new(),
                 false => format!(",\"{name}\":[{}]", items.join(",")),
             };
+            // Metadata as masks over the live prefix, in the shape `live_in` and
+            // `live_out` already use. All-zero for a run that never poisons
+            // anything, and then omitted entirely.
+            let (nar_in, none_in) = tag_masks(&entry_belt, live_in);
+            let (nar_out, none_out) = tag_masks(&f.belt, f.live);
+            for (name, m) in [
+                ("nar_in", nar_in),
+                ("none_in", none_in),
+                ("nar", nar_out),
+                ("none", none_out),
+            ] {
+                if m != 0 {
+                    rec.push_str(&format!(",\"{name}\":{m}"));
+                }
+            }
             rec.push_str(&list(
                 "drops",
                 drops
                     .iter()
                     .map(|(v, s, age)| {
-                        format!("{{\"v\":{v},\"slot\":\"{}\",\"age\":{age}}}", s.tag())
+                        format!(
+                            "{{\"v\":{},\"slot\":\"{}\",\"age\":{age}{}}}",
+                            v.bits,
+                            s.tag(),
+                            tag_field(*v)
+                        )
                     })
                     .collect(),
             ));
@@ -556,7 +650,7 @@ impl<'a> Machine<'a> {
                 "scr",
                 spills
                     .iter()
-                    .map(|(s, v)| format!("{{\"s\":{s},\"v\":{v}}}"))
+                    .map(|(s, v)| format!("{{\"s\":{s},\"v\":{}{}}}", v.bits, tag_field(*v)))
                     .collect(),
             ));
             rec.push_str(&list(
@@ -584,7 +678,7 @@ impl<'a> Machine<'a> {
             return Ok(Some(res));
         }
         if matches!(fop, Some(Op::Sys(0))) {
-            return Err(Stop::Exit((b(0) & 0xff) as i32));
+            return Err(Stop::Exit((b(0).bits & 0xff) as i32));
         }
 
         // -- control transfer -------------------------------------------------
@@ -688,9 +782,22 @@ fn assemble_word(bytes: &[u8], sext: bool) -> u64 {
     v
 }
 
-fn alu(op: AluOp, x: u64, y: u64) -> Result<u64, Stop> {
+/// `,"t":"nar"` for a tagged value, nothing for a plain one — so a trace of a
+/// run that never poisons anything is byte-identical to a pre-metadata trace.
+fn tag_field(v: Value) -> &'static str {
+    match v.tag {
+        Tag::Val => "",
+        Tag::None => ",\"t\":\"none\"",
+        Tag::Nar => ",\"t\":\"nar\"",
+    }
+}
+
+/// Arithmetic on values already known to be untagged. A failure drops a NaR
+/// carrying its origin rather than stopping the machine (PRD §8.6).
+fn alu(op: AluOp, x: u64, y: u64, pc: usize) -> Value {
     let (sx, sy) = (x as i64, y as i64);
-    Ok(match op {
+    let nar = |k| Value::nar(k, pc);
+    Value::val(match op {
         AluOp::Add => x.wrapping_add(y),
         AluOp::Sub => x.wrapping_sub(y),
         AluOp::And => x & y,
@@ -700,39 +807,26 @@ fn alu(op: AluOp, x: u64, y: u64) -> Result<u64, Stop> {
         AluOp::Shr => x.wrapping_shr((y & 63) as u32),
         AluOp::Sar => (sx >> (y & 63)) as u64,
         AluOp::Mul => x.wrapping_mul(y),
-        AluOp::Div => {
+        AluOp::Div | AluOp::Rem => {
             if y == 0 {
-                return Err(Stop::Fault("signed division by zero".into()));
+                return nar(NarKind::DivZero);
             }
             if sx == i64::MIN && sy == -1 {
-                return Err(Stop::Fault(
-                    "signed division overflow (INT_MIN / -1)".into(),
-                ));
+                return nar(NarKind::Overflow);
             }
-            (sx / sy) as u64
+            match op {
+                AluOp::Div => (sx / sy) as u64,
+                _ => (sx % sy) as u64,
+            }
         }
-        AluOp::Divu => {
+        AluOp::Divu | AluOp::Remu => {
             if y == 0 {
-                return Err(Stop::Fault("unsigned division by zero".into()));
+                return nar(NarKind::DivZero);
             }
-            x / y
-        }
-        AluOp::Rem => {
-            if y == 0 {
-                return Err(Stop::Fault("signed remainder by zero".into()));
+            match op {
+                AluOp::Divu => x / y,
+                _ => x % y,
             }
-            if sx == i64::MIN && sy == -1 {
-                return Err(Stop::Fault(
-                    "signed remainder overflow (INT_MIN % -1)".into(),
-                ));
-            }
-            (sx % sy) as u64
-        }
-        AluOp::Remu => {
-            if y == 0 {
-                return Err(Stop::Fault("unsigned remainder by zero".into()));
-            }
-            x % y
         }
         AluOp::Eq => (x == y) as u64,
         AluOp::Ne => (x != y) as u64,

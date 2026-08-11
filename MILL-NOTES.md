@@ -295,6 +295,93 @@ uniform across ALU ops and loads.
 
 ---
 
+## Q3: Operand metadata — what a belt item carries, and whether the scratchpad carries it too
+
+Supports the metadata extension (PRD §8.6). Sourcing caveat up front: the
+`millcomputing.com/wiki/*` pages that cover this best (Metadata, Scratchpad,
+Speculation) are **404 today** and `web.archive.org` was unreachable from here,
+so the wiki quotes below come from a search index of those pages and their
+wording may differ slightly from the original. The HandWiki quotes were
+fetched directly.
+
+### 3a. Verified: the metadata is status, width and vector count — and it *is* the operand descriptor
+
+From the HandWiki mirror of the deleted Wikipedia article
+(https://handwiki.org/wiki/Mill_architecture), fetched directly:
+
+> "Depending on the type and success of load operations, the Mill also assigns
+> metadata to each belt item, including status, width, and vectorization
+> count."
+
+> "**Operations operate on the item described. Thus, the width and vector
+> count are not part of the instruction coding.**"
+
+The second sentence is exactly why Millet carries the status tag and drops the
+other two: on the Mill an operation is width-polymorphic and reads its width
+from the operand, while every Millet op has its width in the encoding, so
+those bits would be carried and never read.
+
+### 3b. Verified: NaR and None are metadata rather than bit patterns, and both propagate
+
+HandWiki, directly:
+
+> "If an operation fails, the failure information is hashed, and placed in the
+> destination, with its metadata, for use in debugging."
+
+> "The NaR items create a fault only if an attempt occurs to store them or
+> perform other non-speculative code on them. If they are never used, no fault
+> is ever created."
+
+> "operations where at least one argument is a `None` generally produce a
+> `None` as output, and when a `None` is attempted to be stored to memory,
+> that store (or portion of a store for vectors where only some elements are
+> `None`) is ignored, leaving that memory location undisturbed."
+
+> "This special `None` value is **not implemented as a reserved bit pattern**,
+> but by using the extra metadata bits that are associated with each belt
+> item."
+
+Precedence and the realizing set, from the wiki/forum via the search index:
+
+> "None has precedence over NaR; a NaR and None is None." — and, on the same
+> point, "the None NaR has a higher precedence over all other kinds of NaR, so
+> if you perform arithmetic with NaR and None values the result is always
+> None; None is used to discard and mask-out speculative execution."
+
+> "If you try and store a NaR, or store to a NaR address, or jump to a NaR
+> address, then the CPU faults. When a realizing operation encounters a None,
+> it does nothing — a load from a None address produces a None, and a store
+> with a None value or address doesn't write anything."
+
+So: the realizing set is stores, control flow and IO; everything else, loads
+included, is speculable. Millet implements exactly this, minus vectors, and
+adds the `sys` case explicitly because Millet's IO is one op (PRD §8.6).
+
+### 3c. The scratchpad preserves metadata. Memory does not.
+
+The answer is unambiguous, from the (offline) Scratchpad and Metadata wiki
+pages via the search index:
+
+> "**The scratch and spill preserves metadata, dealing with belt items and not
+> naked bytes**, maintaining all item state." … "**metadata is preserved in the
+> Scratchpad but discarded again on store.**"
+
+> "If the size of the scratchpad is exceeded during operation, the spiller
+> transparently manages shuffling values into the spill buffer and eventually
+> into system memory, which doesn't pollute the caches and **preserves value
+> metadata**."
+
+This is also the only self-consistent design. The spiller has to save and
+restore the belt and the scratchpad across calls and interrupts *exactly*
+(§2a), and a speculative value that gets parked in scratch has to come back
+speculative — if a spill dropped the tag it would either lose a None or
+silently launder a NaR into a plain value, and speculation across a call
+would be unusable. Memory is the opposite case: it is byte-addressed and
+shared, there is nowhere to put a tag, and that is precisely why `store` is a
+realizing operation. Millet follows both halves.
+
+---
+
 ## Summary: conform/rescue and branches vs. in-flight drops
 
 - `conform`/`rescue` (now: branch-carried argument lists, `rescue` retained;
@@ -332,7 +419,9 @@ reissue/completion/hybrid spiller models any given member uses.
 deferral vs. tag operands (the millcomputing.com wiki is offline); whether
 cycle-counted (non-pickup) loads cross *taken argless branches* in current
 specializer practice or only in principle; any comp.arch detail beyond the
-forum reposts.
+forum reposts; the exact original wording of the wiki's metadata and
+scratchpad pages, which are 404 and reachable only through a search index
+(§3).
 
 ## Sources
 
@@ -346,5 +435,7 @@ forum reposts.
 - [Grab bag of questions](https://millcomputing.com/forum/d/3772-grab-bag-of-questions) (posts #3816, #3817, #3830)
 - [Deferred loads across control flow](https://millcomputing.com/forum/d/1909-deferred-loads-across-control-flow)
 - [US Patent 9,690,581](https://www.freepatentsonline.com/9690581.html)
-- [Mill architecture (HandWiki mirror of Wikipedia)](https://handwiki.org/wiki/Mill_architecture)
+- [Mill architecture (HandWiki mirror of Wikipedia)](https://handwiki.org/wiki/Mill_architecture) — the metadata, NaR and None quotes in §3
+- Mill wiki pages [Metadata](http://millcomputing.com/wiki/Metadata), [Scratchpad](http://millcomputing.com/wiki/Scratchpad) and [Speculation](http://millcomputing.com/wiki/Speculation) — **404 as of 2026-08**; §3 quotes them through a search index
+- [Introduction to the Mill CPU Programming Model](https://millcomputing.com/topic/introduction-to-the-mill-cpu-programming-model-2/) — also 404; same caveat
 - [Veedrac, "To reinvent the processor"](https://medium.com/@veedrac/to-reinvent-the-processor-671139a4a034)
