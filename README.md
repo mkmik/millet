@@ -139,6 +139,35 @@ an interpreter's dispatch. `calli` writes its result count at the call site
 (`calli b3, b1 -> 1`) because the belt has to renumber by an amount the
 assembler knows and the callee is not one of those.
 
+### Named belt values
+
+`-> name` names what an op drops; `%name` reads it back at whatever position
+it has drifted to by then. `examples/strlen.mil` is written this way.
+
+```
+.ebb sl_loop(count, p)              ; the entry values get names too
+    m   load  %p, 0, 1, zero, 3 -> byte
+    a0  con   1 -> one
+
+    a0  add   %count, %one -> count1
+    a1  add   %p, %one -> p1
+```
+
+Notation only: no scheduling, no allocation, no reordering, and the same
+bytes out. Names mix freely with raw `bN`, and a name is scoped to its EBB,
+so the checker can name which of the three things bit you —
+
+```
+bad.mil:8: error[E1]: `%byte` is dropped by this same bundle; every read sees
+the belt as it stood at bundle entry; live here: %count %p
+bad.mil:7: error[E1]: `%hi` fell off the belt 1 bundle(s) ago; live here: %lo
+```
+
+`.func f(lo, hi)` and `.ebb l(a, b)` name the entry values and count
+themselves, so the arity stays where it was. `calli b3 -> lo, hi` does the
+same for its result count. `rescue` still takes a mask: it selects by
+position on purpose.
+
 ### The three things that will bite you
 
 1. **Every drop renumbers the belt.** Two ALU ops in one bundle drop in slot
@@ -209,7 +238,7 @@ Each check has a stable code and a test in `millet-asm/tests/checks.rs`.
 
 | code | check |
 |------|-------|
-| E1 | a belt reference names a position holding no live value |
+| E1 | a belt reference names a position holding no live value, or a `%name` is not on the belt there |
 | E2 | an edge into an EBB does not deliver its entry arity |
 | E3 | the op is not legal in its slot |
 | E4 | a read of a position no value has reached yet, with ops in flight |

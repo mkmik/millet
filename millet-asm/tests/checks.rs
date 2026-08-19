@@ -338,3 +338,269 @@ fn a_bundle_may_not_reuse_a_slot() {
         "E0",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Named belt values — notation over the same positions, resolved by the belt
+// model in `check.rs`.
+
+/// Every error message, joined; for the checks that are about the wording.
+fn message(src: &str) -> String {
+    match asm::assemble(src, &Config::default()) {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e
+            .diags
+            .iter()
+            .map(|d| d.msg.clone())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn image(src: &str) -> Vec<u8> {
+    asm::assemble(src, &Config::default())
+        .unwrap_or_else(|e| {
+            let m: Vec<String> = e.diags.iter().map(|d| d.render("<test>")).collect();
+            panic!("{}", m.join("\n"))
+        })
+        .image
+        .to_bytes()
+}
+
+/// The whole point: names are notation. The same program written both ways
+/// has to encode to the same bytes.
+#[test]
+fn names_encode_exactly_like_the_positions_they_stand_for() {
+    let positional = "
+.func main(0) -> 0
+    a0  con 20
+
+    f   call fib, b0
+
+    f   retn
+
+.func fib(1) -> 1
+    a0  con 2
+
+    a0  lt  b1, b0
+
+    f   conform b0, b2
+
+    f   brt b0, fib_base
+
+.ebb fib_rec(2)
+    a0  con 1
+
+    a0  sub b2, b0
+    a1  con 2
+
+    a0  sub b4, b0
+
+    f   call fib, b2
+
+    f   call fib, b1
+
+    a0  add b0, b1
+
+    f   retn b0
+
+.ebb fib_base(2)
+    f   retn b1
+";
+    let named = "
+.func main(0) -> 0
+    a0  con 20 -> n
+
+    f   call fib, b0 -> r          ; names mix freely with raw positions
+
+    f   retn
+
+.func fib(n) -> 1
+    a0  con 2 -> two
+
+    a0  lt  %n, %two -> cond
+
+    f   conform %cond, %n
+
+    f   brt %cond, fib_base
+
+.ebb fib_rec(cond, n)
+    a0  con 1 -> one
+
+    a0  sub %n, %one -> nm1
+    a1  con 2 -> two
+
+    a0  sub %n, %two -> nm2
+
+    f   call fib, %nm1 -> r1
+
+    f   call fib, %nm2 -> r2
+
+    a0  add %r2, %r1 -> sum
+
+    f   retn %sum
+
+.ebb fib_base(cond, n)
+    f   retn %n
+";
+    assert_eq!(image(positional), image(named));
+}
+
+/// `calli` writes its result count at the call site; a name list counts itself.
+#[test]
+fn calli_result_names_are_the_result_count() {
+    let positional = "
+.func main(0) -> 0
+    a0  con @two
+
+    f   calli b0 -> 2
+
+    a0  add b1, b0
+
+    f   retn
+
+.func two(0) -> 2
+    a0  con 1
+    a1  con 2
+
+    f   retn b0, b1
+";
+    let named = "
+.func main(0) -> 0
+    a0  con @two -> f
+
+    f   calli %f -> x, y
+
+    a0  add %x, %y
+
+    f   retn
+
+.func two(0) -> 2
+    a0  con 1
+    a1  con 2
+
+    f   retn b0, b1
+";
+    assert_eq!(image(positional), image(named));
+}
+
+#[test]
+fn a_name_that_was_never_dropped_is_not_in_scope() {
+    let m = message(
+        "
+.func main(0) -> 0
+    a0  con 1 -> x
+
+    a0  add %x, %nope
+
+    f   retn
+",
+    );
+    assert!(m.contains("no value named `%nope`"), "{m}");
+    assert!(m.contains("live here: %x"), "{m}");
+}
+
+/// The name outlives the value, and the error says by how much.
+#[test]
+fn a_name_that_fell_off_the_belt_says_when() {
+    let m = message(
+        "
+.func main(0) -> 0
+    a0  con 1 -> x
+    a1  con 2 -> y
+
+    f   conform b0
+
+    a0  add %x, b0
+
+    f   retn
+",
+    );
+    assert!(m.contains("`%x` fell off the belt 1 bundle(s) ago"), "{m}");
+}
+
+/// Rule 2 of "the three things that will bite you", now with a name on it.
+#[test]
+fn a_name_dropped_by_this_bundle_is_not_readable_in_it() {
+    let m = message(
+        "
+.func main(0) -> 0
+    a0  con 1 -> x
+    a1  add %x, %x
+
+    f   retn
+",
+    );
+    assert!(m.contains("dropped by this same bundle"), "{m}");
+}
+
+/// A reshape does read the belt after this bundle's drops, so there the same
+/// name resolves.
+#[test]
+fn a_reshape_sees_this_bundle_s_names() {
+    assert_clean(
+        "
+.func main(0) -> 0
+    a0  con 1 -> x
+    f   conform %x
+
+    f   retn
+",
+    );
+}
+
+#[test]
+fn the_number_of_result_names_has_to_match() {
+    let m = message(
+        "
+.func main(0) -> 0
+    a0  con 1 -> x, y
+
+    f   retn
+",
+    );
+    assert!(m.contains("drops 1 value(s) but 2 name(s)"), "{m}");
+}
+
+/// A loop rewrites the same name every iteration, so the newest one wins.
+#[test]
+fn a_name_written_twice_shadows_the_older_value() {
+    let positional = "
+.func main(0) -> 0
+    a0  con 1
+
+    a0  con 2
+
+    a0  add b0, b1
+
+    f   retn
+";
+    let named = "
+.func main(0) -> 0
+    a0  con 1 -> x
+
+    a0  con 2 -> x
+
+    a0  add %x, b1
+
+    f   retn
+";
+    assert_eq!(image(positional), image(named));
+}
+
+#[test]
+fn names_are_scoped_to_their_ebb() {
+    assert_error(
+        "
+.func main(0) -> 0
+    a0  con 1 -> x
+
+    f   br next
+
+.ebb next(1)
+    a0  add %x, b0
+
+    f   retn
+",
+        "E1",
+    );
+}
