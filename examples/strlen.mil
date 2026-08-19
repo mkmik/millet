@@ -1,4 +1,10 @@
-; strlen.mil — M3: a loop with a deferred load inside the body.
+; strlen.mil — M3: a loop with a deferred load inside the body, written with
+; named belt values.
+;
+; `-> name` names what an op drops and `%name` reads it back; the assembler
+; resolves the name to the position it holds *in that bundle*. Nothing about
+; the machine changes — this file encodes byte-identically to the same program
+; written `b0`, `b3`, `b5` — but nobody has to count.
 ;
 ; The load is issued at the top of the body and used three bundles later, so
 ; nothing is ever in flight across the back edge (PRD §4, check E9).
@@ -9,42 +15,34 @@
 .asciiz "hello, millet"
 
 .func main(0) -> 0
-    a0  con 0x1000
-                                ; belt: b0=p
+    a0  con 0x1000 -> p
 
-    f   call strlen, b0
-                                ; belt: b0=len b1=p
+    f   call strlen, %p -> len
 
     f   sys 0                   ; exit(len)
 
 ; ---------------------------------------------------------------------------
 
-.func strlen(1) -> 1            ; b0=p
-    a0  con 0
-                                ; belt: b0=count b1=p
+.func strlen(p) -> 1
+    a0  con 0 -> count
                                 ; falls through into sl_loop, which is an edge
 
-.ebb sl_loop(2)                 ; b0=count b1=p
-    m   load  b1, 0, 1, zero, 3     ; retires end of +2
-    a0  con   1
-                                ; belt: b0=1 b1=count b2=p
+.ebb sl_loop(count, p)
+    m   load  %p, 0, 1, zero, 3 -> byte     ; retires end of +2
+    a0  con   1 -> one
 
-    a0  add   b1, b0                ; count+1
-    a1  add   b2, b0                ; p+1
-                                ; belt: b0=p+1 b1=count+1 b2=1 b3=count b4=p
+    a0  add   %count, %one -> count1
+    a1  add   %p, %one -> p1
 
-    a0  nop                         ; the load lands here
-                                ; belt: b0=byte b1=p+1 b2=count+1 ...
+    a0  nop                                 ; the load lands here
 
-    f   conform b2, b1, b0          ; carried pair, then the branch condition
-                                ; belt: b0=count+1 b1=p+1 b2=byte
+    f   conform %count1, %p1, %byte         ; carried pair, then the condition
 
-    f   brt b2, sl_loop             ; b2 is truncated away on entry
+    f   brt %byte, sl_loop                  ; byte is truncated away on entry
 
-.ebb sl_done(3)                 ; b0=count b1=p b2=0
-    a0  con 1
-                                ; belt: b0=1 b1=count ...
+.ebb sl_done(count, p, term)
+    a0  con 1 -> one
 
-    a0  sub b1, b0                  ; the terminator was counted; undo it
+    a0  sub %count, %one -> len             ; the terminator was counted
 
-    f   retn b0
+    f   retn %len

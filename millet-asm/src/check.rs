@@ -8,7 +8,8 @@
 //!
 //! | code | check |
 //! |------|-------|
-//! | E1 | belt reference names a position holding no live value |
+//! | E1 | belt reference names a position holding no live value, or a `%name` \
+//!        that is not on the belt here |
 //! | E2 | EBB entry arity not satisfied on a predecessor edge |
 //! | E3 | op not legal in its slot |
 //! | E4 | read of a position no value has reached yet, with ops still in flight |
@@ -18,8 +19,12 @@
 //! | E8 | (warning) store overlaps an in-flight load's delay window |
 //! | E9 | operation still in flight at a control transfer out of an EBB |
 
+use std::collections::HashMap;
+
 use millet_core::isa::{BrKind, Op, Slot};
 use millet_core::{Config, Image};
+
+use crate::asm::{NAMED, SrcOp};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diag {
@@ -66,6 +71,8 @@ pub struct Prediction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Cell {
     id: u32,
+    /// Index into `Ctx::names`, for a value written `-> name`.
+    name: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +83,8 @@ struct Pend {
     n: usize,
     line: usize,
     what: String,
+    /// Names for the values this op will drop, in drop order.
+    names: Vec<Option<u32>>,
     /// For loads: (address cell id, low byte offset, high byte offset).
     load_range: Option<(u32, i64, i64)>,
 }
@@ -87,12 +96,27 @@ struct Ctx<'a> {
     func_names: &'a [String],
     diags: Vec<Diag>,
     next_id: u32,
+    /// Interned value names; a `Cell` carries an index into this.
+    names: Vec<String>,
+    name_ids: HashMap<String, u32>,
 }
 
 impl Ctx<'_> {
-    fn fresh(&mut self) -> Cell {
+    fn fresh(&mut self, name: Option<u32>) -> Cell {
         self.next_id += 1;
-        Cell { id: self.next_id }
+        Cell {
+            id: self.next_id,
+            name,
+        }
+    }
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&i) = self.name_ids.get(s) {
+            return i;
+        }
+        self.names.push(s.to_string());
+        let i = self.names.len() as u32 - 1;
+        self.name_ids.insert(s.to_string(), i);
+        i
     }
     fn err(&mut self, code: &'static str, line: usize, msg: String) {
         self.diags.push(Diag::err(code, line, msg));
@@ -114,10 +138,14 @@ fn live_mask(belt: &Belt) -> u16 {
     m
 }
 
+/// Checks the belt discipline of every EBB, and — the same walk, since the
+/// answer is the same one — rewrites `%name` operands in `bundles` to the
+/// positions they stand for.
 pub fn check(
     image: &Image,
-    bundles: &[crate::asm::SrcBundle],
+    bundles: &mut [crate::asm::SrcBundle],
     ebb_names: &[String],
+    ebb_args: &[Vec<String>],
     func_names: &[String],
     cfg: &Config,
 ) -> (Vec<Diag>, Prediction) {
@@ -128,6 +156,8 @@ pub fn check(
         func_names,
         diags: Vec::new(),
         next_id: 0,
+        names: Vec::new(),
+        name_ids: HashMap::new(),
     };
     let mut pred = Prediction {
         live: vec![0; bundles.len()],
@@ -152,18 +182,30 @@ pub fn check(
             .filter(|b| *b > start)
             .min()
             .unwrap_or(bundles.len());
-        check_ebb(&mut ctx, ei, start, end, bundles, &func_of_ebb, &mut pred);
+        let args = ebb_args.get(ei).map(Vec::as_slice).unwrap_or(&[]);
+        check_ebb(
+            &mut ctx,
+            ei,
+            start,
+            end,
+            bundles,
+            args,
+            &func_of_ebb,
+            &mut pred,
+        );
     }
 
     (ctx.diags, pred)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_ebb(
     ctx: &mut Ctx,
     ei: usize,
     start: usize,
     end: usize,
-    bundles: &[crate::asm::SrcBundle],
+    bundles: &mut [crate::asm::SrcBundle],
+    args: &[String],
     func_of_ebb: &[usize],
     pred: &mut Prediction,
 ) {
@@ -171,20 +213,37 @@ fn check_ebb(
     let arity = ctx.image.ebbs[ei].arity as usize;
     let mut belt: Belt = vec![None; cfg.belt];
     for i in 0..arity.min(cfg.belt) {
-        belt[i] = Some(ctx.fresh());
+        let name = args.get(i).map(|n| ctx.intern(n));
+        belt[i] = Some(ctx.fresh(name));
     }
     let mut pending: Vec<Pend> = Vec::new();
     let ebb_name = ctx.ebb_names[ei].clone();
+    // Bundle in which each name was last shifted off the belt, so a read that
+    // just missed it can say by how much.
+    let mut gone: HashMap<u32, usize> = HashMap::new();
 
     for t in start..end {
         pred.live[t] = live_mask(&belt);
-        let bundle = &bundles[t];
         let mut retiring: Vec<Pend> = Vec::new();
+        let entry_names = live_names(&belt);
+        // Named by an op in *this* bundle: no read can see those yet, and
+        // saying that beats "no such name".
+        let dropped_here: Vec<u32> = bundles[t]
+            .ops
+            .iter()
+            .flatten()
+            .flat_map(|so| so.results.iter())
+            .map(|n| ctx.intern(n))
+            .collect();
 
         for slot in Slot::ALL {
-            let Some(so) = &bundle.ops[slot.index()] else {
+            let Some(so) = bundles[t].ops[slot.index()].as_mut() else {
                 continue;
             };
+            // Reshapes read the post-drop belt (PRD §7.2), so their names
+            // resolve down with the rest of the reshape.
+            let named_ok =
+                so.op.is_reshape() || resolve_names(ctx, &belt, so, &gone, &dropped_here, t);
             let (op, line) = (&so.op, so.line);
 
             if !op.allowed_in(slot) {
@@ -196,7 +255,7 @@ fn check_ebb(
             }
 
             // Reshapes read the post-drop belt (PRD §7.2); handled below.
-            if !op.is_reshape() {
+            if !op.is_reshape() && named_ok {
                 for r in op.belt_reads() {
                     read_check(ctx, &belt, &pending, r, line, op);
                 }
@@ -329,6 +388,21 @@ fn check_ebb(
 
             // Schedule the results.
             let n = op.n_results(callee_nres);
+            let names: Vec<Option<u32>> = match so.results.len() {
+                0 => vec![None; n],
+                k if k == n => so.results.iter().map(|r| Some(ctx.intern(r))).collect(),
+                k => {
+                    ctx.err(
+                        "E0",
+                        line,
+                        format!(
+                            "`{}` drops {n} value(s) but {k} name(s) follow `->`",
+                            mnemonic(op)
+                        ),
+                    );
+                    vec![None; n]
+                }
+            };
             if n > 0 {
                 let lat = op.latency().unwrap_or(1) as usize;
                 let load_range = match op {
@@ -350,6 +424,7 @@ fn check_ebb(
                     n,
                     line,
                     what: mnemonic(op).to_string(),
+                    names,
                     load_range,
                 };
                 if p.retire_at == t {
@@ -372,15 +447,22 @@ fn check_ebb(
         }
         retiring.sort_by_key(|p| (p.issue, p.slot));
         for p in &retiring {
-            for _ in 0..p.n {
-                let c = ctx.fresh();
+            for k in 0..p.n {
+                let c = ctx.fresh(p.names.get(k).copied().flatten());
                 belt.pop();
                 belt.insert(0, Some(c));
             }
         }
 
-        // Reshape, applied last against the post-drop belt (PRD §7.2).
-        if let Some(so) = &bundle.ops[Slot::F.index()] {
+        // Reshape, applied last against the post-drop belt (PRD §7.2) — which
+        // is also the belt its `%name` operands resolve against.
+        if let Some(so) = bundles[t].ops[Slot::F.index()].as_mut()
+            && so.op.is_reshape()
+            && !resolve_names(ctx, &belt, so, &gone, &[], t)
+        {
+            return;
+        }
+        if let Some(so) = &bundles[t].ops[Slot::F.index()] {
             match &so.op {
                 Op::Conform(list) => {
                     let mut nb: Belt = vec![None; cfg.belt];
@@ -424,8 +506,14 @@ fn check_ebb(
             }
         }
 
+        for id in entry_names {
+            if !belt.iter().flatten().any(|c| c.name == Some(id)) {
+                gone.insert(id, t);
+            }
+        }
+
         // Control transfer out of this EBB.
-        let fop = bundle.ops[Slot::F.index()].as_ref();
+        let fop = bundles[t].ops[Slot::F.index()].as_ref();
         let is_last = t + 1 == end;
         let mut terminated = false;
 
@@ -484,7 +572,7 @@ fn check_ebb(
             if t + 1 >= bundles.len() {
                 ctx.err(
                     "E0",
-                    bundle.line,
+                    bundles[t].line,
                     format!(
                         "EBB `{ebb_name}` runs off the end of the program without a terminator"
                     ),
@@ -495,10 +583,120 @@ fn check_ebb(
                 .image
                 .ebb_at(t as u32 + 1)
                 .expect("bundle after an EBB must start an EBB");
-            let line = fop.map(|o| o.line).unwrap_or(bundle.line);
+            let line = fop.map(|o| o.line).unwrap_or(bundles[t].line);
             edge_check(ctx, &belt, &pending, Some(target), line, &ebb_name);
             return;
         }
+    }
+}
+
+fn live_names(belt: &Belt) -> Vec<u32> {
+    belt.iter().flatten().filter_map(|c| c.name).collect()
+}
+
+/// The most recently dropped live value carrying `id`; a name written twice
+/// shadows the earlier one.
+fn find_name(belt: &Belt, id: u32) -> Option<usize> {
+    belt.iter()
+        .enumerate()
+        .filter_map(|(i, c)| (*c).filter(|c| c.name == Some(id)).map(|c| (i, c.id)))
+        .max_by_key(|(_, cid)| *cid)
+        .map(|(i, _)| i)
+}
+
+/// Rewrite this op's `%name` operands into the positions they hold right now.
+/// False if one of them did not resolve, in which case the caller skips the
+/// position checks — they would be about a position nobody wrote.
+fn resolve_names(
+    ctx: &mut Ctx,
+    belt: &Belt,
+    so: &mut SrcOp,
+    gone: &HashMap<u32, usize>,
+    dropped_here: &[u32],
+    t: usize,
+) -> bool {
+    if so.names.is_empty() {
+        return true;
+    }
+    let (line, names) = (so.line, &so.names);
+    let mut ok = true;
+    each_read(&mut so.op, &mut |p: &mut u8| {
+        if *p < NAMED {
+            return;
+        }
+        let name = &names[(*p & !NAMED) as usize];
+        let id = ctx.intern(name);
+        if let Some(i) = find_name(belt, id) {
+            *p = i as u8;
+            return;
+        }
+        ok = false;
+        let mut msg = if dropped_here.contains(&id) {
+            format!(
+                "`%{name}` is dropped by this same bundle; every read sees the belt \
+                 as it stood at bundle entry"
+            )
+        } else if let Some(g) = gone.get(&id) {
+            format!("`%{name}` fell off the belt {} bundle(s) ago", t - g)
+        } else {
+            format!("no value named `%{name}` is in scope here")
+        };
+        let live: Vec<String> = live_names(belt)
+            .iter()
+            .map(|n| format!("%{}", ctx.names[*n as usize]))
+            .collect();
+        if !live.is_empty() {
+            msg += &format!("; live here: {}", live.join(" "));
+        }
+        ctx.err("E1", line, msg);
+    });
+    ok
+}
+
+/// Every belt read operand, mutably. `conform`'s list counts as reads: they
+/// are just taken after this bundle's drops.
+fn each_read(op: &mut Op, visit: &mut dyn FnMut(&mut u8)) {
+    match op {
+        Op::Alu { a, b, .. } => {
+            visit(a);
+            visit(b);
+        }
+        Op::Pick { c, t, f } => {
+            visit(c);
+            visit(t);
+            visit(f);
+        }
+        Op::IsNar { a } | Op::IsNone { a } => visit(a),
+        Op::Load { addr, .. } => visit(addr),
+        Op::Store { addr, val, .. } => {
+            visit(addr);
+            visit(val);
+        }
+        Op::Spill { val, .. } => visit(val),
+        Op::Br { cond, .. } => visit(cond),
+        Op::BrI { target } => visit(target),
+        Op::Call { args, .. } => {
+            for a in args {
+                visit(a);
+            }
+        }
+        Op::CallI { target, args, .. } => {
+            visit(target);
+            for a in args {
+                visit(a);
+            }
+        }
+        Op::Retn { res } => {
+            for r in res {
+                visit(r);
+            }
+        }
+        Op::Conform(list) => {
+            for p in list {
+                visit(p);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -3,7 +3,10 @@
 //! Syntax (PRD §9.2): one op per line prefixed by its slot tag (`a0`, `a1`,
 //! `m`, `f`); a blank line or a directive ends the bundle. Comments start
 //! with `;`. Belt operands are literal positions `b0..b15` — the assembler
-//! never invents them, it only checks them (see `check.rs`).
+//! never invents them, it only checks them (see `check.rs`). They can also be
+//! written `%name` against a `-> name` earlier in the EBB, which is notation
+//! over the very same positions: `check.rs` resolves it while it walks the
+//! belt it already models.
 
 use std::collections::HashMap;
 
@@ -12,12 +15,21 @@ use millet_core::{BELT_MAX, Config, DataSeg, EbbEntry, FuncEntry, Image, SCRATCH
 
 use crate::check::{self, Diag, Prediction};
 
+/// A read operand written as `%name`: `NAMED | i` stands for `SrcOp::names[i]`
+/// until `check.rs` rewrites it to a real position, which it can do because it
+/// already walks the belt (PRD §3.2).
+pub const NAMED: u8 = 0x80;
+
 /// An op as written, with its branch/call target still symbolic.
 #[derive(Clone, Debug)]
 pub struct SrcOp {
     pub op: Op,
     pub target: Target,
     pub line: usize,
+    /// Names behind this op's `NAMED` read operands.
+    pub names: Vec<String>,
+    /// `-> a, b`: names for the values this op drops, in drop order.
+    pub results: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +55,8 @@ impl SrcBundle {
 enum Item {
     Head {
         name: String,
+        /// Entry value names, when the arity was written as `f(a, b)`.
+        args: Vec<String>,
         arity: u8,
         nres: u8,
         is_func: bool,
@@ -80,6 +94,7 @@ pub fn assemble(src: &str, cfg: &Config) -> Result<Assembled, AsmError> {
     let mut ebbs: Vec<EbbEntry> = Vec::new();
     let mut funcs: Vec<FuncEntry> = Vec::new();
     let mut ebb_names: Vec<String> = Vec::new();
+    let mut ebb_args: Vec<Vec<String>> = Vec::new();
     let mut func_names: Vec<String> = Vec::new();
     let mut ebb_of: HashMap<String, u32> = HashMap::new();
     let mut func_of: HashMap<String, u16> = HashMap::new();
@@ -90,6 +105,7 @@ pub fn assemble(src: &str, cfg: &Config) -> Result<Assembled, AsmError> {
         match item {
             Item::Head {
                 name,
+                args,
                 arity,
                 nres,
                 is_func,
@@ -106,6 +122,7 @@ pub fn assemble(src: &str, cfg: &Config) -> Result<Assembled, AsmError> {
                     name: name.clone(),
                 });
                 ebb_names.push(name.clone());
+                ebb_args.push(args.clone());
                 ebb_of.insert(name.clone(), idx);
                 if *is_func {
                     if *arity as usize > isa::MAX_ARGS {
@@ -219,6 +236,48 @@ pub fn assemble(src: &str, cfg: &Config) -> Result<Assembled, AsmError> {
         return Err(AsmError { diags: p.diags });
     }
 
+    let mut image = Image {
+        bundles: Vec::new(),
+        ebbs,
+        funcs,
+        data,
+        entry,
+    };
+
+    // Static checks (PRD §9.3). The same walk resolves `%name` operands, so it
+    // has to run before the encoding, which only speaks belt positions.
+    let (mut diags, prediction) = check::check(
+        &image,
+        &mut bundles,
+        &ebb_names,
+        &ebb_args,
+        &func_names,
+        cfg,
+    );
+    p.diags.append(&mut diags);
+
+    if p.diags.iter().any(|d| !d.warning) {
+        return Err(AsmError { diags: p.diags });
+    }
+
+    // Bundles before the first label belong to no EBB, so the walk above never
+    // reached them and their names are still unresolved.
+    let first = image
+        .ebbs
+        .first()
+        .map_or(bundles.len(), |e| e.bundle as usize);
+    for b in &bundles[..first] {
+        for so in b.ops.iter().flatten() {
+            if let Some(n) = so.names.first() {
+                p.err(
+                    "E1",
+                    so.line,
+                    format!("no value named `%{n}` is in scope here: this bundle is before the first `.func`"),
+                );
+            }
+        }
+    }
+
     // Encode.
     let mut words: Vec<[u32; 4]> = Vec::with_capacity(bundles.len());
     for b in &bundles {
@@ -233,18 +292,7 @@ pub fn assemble(src: &str, cfg: &Config) -> Result<Assembled, AsmError> {
         }
         words.push(w);
     }
-
-    let image = Image {
-        bundles: words,
-        ebbs,
-        funcs,
-        data,
-        entry,
-    };
-
-    // Static checks (PRD §9.3).
-    let (mut diags, prediction) = check::check(&image, &bundles, &ebb_names, &func_names, cfg);
-    p.diags.append(&mut diags);
+    image.bundles = words;
 
     if p.diags.iter().any(|d| !d.warning) {
         return Err(AsmError { diags: p.diags });
@@ -269,6 +317,8 @@ struct Parser<'a> {
     cfg: &'a Config,
     diags: Vec<Diag>,
     defs: HashMap<String, i64>,
+    /// Names read by the op being parsed, in `NAMED` index order.
+    reads: Vec<String>,
 }
 
 type ParseOut = (Vec<Item>, Vec<DataSeg>, Option<String>);
@@ -280,6 +330,7 @@ impl<'a> Parser<'a> {
             cfg,
             diags: Vec::new(),
             defs: HashMap::new(),
+            reads: Vec::new(),
         }
     }
 
@@ -443,7 +494,15 @@ impl<'a> Parser<'a> {
             );
             return Err(());
         };
-        let arity = self.imm(arity.trim(), line)?;
+        // `f(2)` is a count; `f(lo, hi)` names the entry values and counts
+        // itself.
+        let (arity, args) = match parse_imm(arity.trim(), &self.defs) {
+            Some(v) => (v, Vec::new()),
+            None => {
+                let a = self.names(arity, line)?;
+                (a.len() as i64, a)
+            }
+        };
         if arity < 0 || arity as usize > self.cfg.belt {
             self.err(
                 "E0",
@@ -462,6 +521,7 @@ impl<'a> Parser<'a> {
         }
         Ok(Item::Head {
             name: name.trim().to_string(),
+            args,
             arity: arity as u8,
             nres: nres as u8,
             is_func,
@@ -470,7 +530,14 @@ impl<'a> Parser<'a> {
     }
 
     fn op(&mut self, text: &str, line: usize) -> Result<SrcOp, ()> {
+        self.reads.clear();
         let (mnem, rest) = split_first_word(text.trim());
+        // `-> a, b` names what the op drops — except on `calli`, where `->`
+        // already carries the result count.
+        let (rest, mut results) = match (mnem == "calli", rest.split_once("->")) {
+            (false, Some((head, names))) => (head, self.names(names, line)?),
+            _ => (rest, Vec::new()),
+        };
         let args: Vec<&str> = if rest.trim().is_empty() {
             Vec::new()
         } else {
@@ -665,7 +732,15 @@ impl<'a> Parser<'a> {
                         );
                         return Err(());
                     }
-                    let nres = self.imm(ret.trim(), line)?;
+                    // `-> 2` is a count; `-> lo, hi` names the results and
+                    // counts itself.
+                    let nres = match parse_imm(ret.trim(), &self.defs) {
+                        Some(v) => v,
+                        None => {
+                            results = self.names(ret, line)?;
+                            results.len() as i64
+                        }
+                    };
                     if !(0..=isa::MAX_ARGS as i64).contains(&nres) {
                         self.err("E6", line, format!("calli returns {nres} values; max 3"));
                         return Err(());
@@ -770,10 +845,44 @@ impl<'a> Parser<'a> {
                 }
             }
         };
-        Ok(SrcOp { op, target, line })
+        Ok(SrcOp {
+            op,
+            target,
+            line,
+            names: std::mem::take(&mut self.reads),
+            results,
+        })
+    }
+
+    /// A comma-separated name list; empty text is an empty list.
+    fn names(&mut self, s: &str, line: usize) -> Result<Vec<String>, ()> {
+        let mut out = Vec::new();
+        for n in s.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            if !is_ident(n) {
+                self.err("E0", line, format!("`{n}` is not a name"));
+                return Err(());
+            }
+            out.push(n.to_string());
+        }
+        Ok(out)
     }
 
     fn belt(&mut self, s: &str, line: usize) -> Result<u8, ()> {
+        if let Some(name) = s.strip_prefix('%') {
+            let name = name.trim();
+            if !is_ident(name) {
+                self.err("E0", line, format!("`%{name}` is not a name"));
+                return Err(());
+            }
+            let i = match self.reads.iter().position(|n| n == name) {
+                Some(i) => i,
+                None => {
+                    self.reads.push(name.to_string());
+                    self.reads.len() - 1
+                }
+            };
+            return Ok(NAMED | i as u8);
+        }
         let ok = s
             .strip_prefix('b')
             .and_then(|d| d.parse::<usize>().ok())
@@ -899,6 +1008,12 @@ fn parse_imm(s: &str, defs: &HashMap<String, i64>) -> Option<i64> {
         body.replace('_', "").parse::<i64>().ok()?
     };
     Some(if neg { -v } else { v })
+}
+
+fn is_ident(s: &str) -> bool {
+    let mut c = s.chars();
+    c.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && c.all(|c| c.is_alphanumeric() || c == '_')
 }
 
 fn strip_comment(line: &str) -> &str {
